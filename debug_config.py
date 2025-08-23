@@ -1,0 +1,9 @@
+# debug_config
+
+# Testing parameters 
+DEBUG_BATCH = 2
+DEBUG_SEQ_LEN = 24
+DEBUG_VOCAB_SIZE = 16
+DEBUG_MAP_TOKEN_CLASSES = 8  
+DEBUG_MAP_SEQ_CLASSES   = 8   
+PAD_TOKEN_ID = 0
