@@ -1,0 +1,73 @@
+
+from __future__ import annotations
+import json, os, hashlib, time
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def tokenizer_checksum(tokenizer) -> Dict[str, Any]:
+    payload = {
+        "special_tokens": getattr(tokenizer, "special_tokens", []),
+        "vocab": getattr(tokenizer, "vocab", {}),
+        "k": getattr(tokenizer, "k", None),
+        "vocab_size": len(getattr(tokenizer, "vocab", {})),
+        "bpe_merges": len(getattr(tokenizer, "bpe_ranks", {})) if hasattr(tokenizer, "bpe_ranks") else None,
+    }
+    blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return {"sha256": _sha256_bytes(blob), "meta": payload}
+
+def save_json(obj: Any, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+@dataclass
+class ConfigSnapshot:
+    timestamp: str
+    config: Dict[str, Any]
+
+def save_config_snapshot(cfg_module, out_dir: str, name: str = "config_snapshot.json"):
+    snap = ConfigSnapshot(timestamp=_now_iso(), config={k: getattr(cfg_module, k) for k in dir(cfg_module) if k.isupper()})
+    save_json(asdict(snap), os.path.join(out_dir, name))
+
+@dataclass
+class DatasetManifest:
+    timestamp: str
+    files: List[Dict[str, Any]]
+
+def make_dataset_manifest(paths: List[str]) -> DatasetManifest:
+    entries = []
+    for p in paths:
+        try:
+            entries.append({"path": p, "sha256": sha256_file(p), "size": os.path.getsize(p)})
+        except Exception as e:
+            entries.append({"path": p, "error": str(e)})
+    return DatasetManifest(timestamp=_now_iso(), files=entries)
+
+def save_dataset_manifest(paths: List[str], out_dir: str, name: str):
+    manifest = make_dataset_manifest(paths)
+    save_json(asdict(manifest), os.path.join(out_dir, name))
+
+def log_stage_gate(stage_name: str, metrics_prev: Dict[str, Any], metrics_curr: Dict[str, Any], decision: Dict[str, Any], out_dir: str):
+    record = {
+        "timestamp": _now_iso(),
+        "stage": stage_name,
+        "prev": metrics_prev,
+        "curr": metrics_curr,
+        "decision": decision,
+    }
+    save_json(record, os.path.join(out_dir, f"stage_gate_{stage_name}.json"))
