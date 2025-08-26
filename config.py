@@ -10,14 +10,15 @@ STAGE5_WEAK_RIBOZYME_SEQCLS = ["data/weak_ribozyme_seqcls.txt"]
 STAGE6_GOLD_MIXED = ["data/gold_motifs_mixed.jsonl"]
 
 # Global sampling for tokenizer & Stage 1a
-DATASET_FRACTION = 0.0001        
+DATASET_FRACTION = 0.0001
+TRAINSET_FRACTION = DATASET_FRACTION
 RANDOM_SEED = 42
 
 # Pretraining Tasks 
 STAGE1_TASKS = ["mlm", "span", "kmer_reorder", "dae"]
 STAGE6_TASKS = ["masked_motif", "mbp", "map", "cml"]
 
-# Select Pretraining Task 
+# Pretraining Task Selection
 PRETRAIN_TASK = "kmer_reorder"   # Select one : "mlm", "span", "kmer_reorder", "dae"
 
 # Tokenizer Selection 
