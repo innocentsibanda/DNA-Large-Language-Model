@@ -1,11 +1,16 @@
-# Training and Evaluation 
+
+# train and evaluation
+
 from __future__ import annotations
+
 import math
 from typing import Optional, Dict, Tuple, Any, List
 
 import numpy as np
 import torch
 from torch import Tensor
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import (
     precision_recall_fscore_support,
     confusion_matrix,
@@ -13,7 +18,11 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from config import PRETRAIN_TASK, SELF_SUP_STREAM
+try:
+    from config import PRETRAIN_TASK, SELF_SUP_STREAM
+except Exception:
+    PRETRAIN_TASK = "mlm"
+    SELF_SUP_STREAM = "kmer"
 
 def _to_numpy(x: Tensor | np.ndarray) -> np.ndarray:
     if isinstance(x, np.ndarray):
@@ -22,7 +31,6 @@ def _to_numpy(x: Tensor | np.ndarray) -> np.ndarray:
 
 def _safe_mean(x: List[float]) -> float:
     return float(np.mean(x)) if len(x) > 0 else float("nan")
-
 
 def compute_per_class_accuracy(preds: Tensor, labels: Tensor, num_classes: int) -> list:
     per_class_acc = []
@@ -141,6 +149,7 @@ def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, n_bins: in
             ece += (np.sum(mask) / N) * abs(avg_conf - avg_acc)
     return float(ece)
 
+
 def prediction_entropy_distribution_stats(probs: np.ndarray) -> dict:
     if probs.size == 0:
         return {"entropy_mean": float("nan"), "entropy_std": float("nan"),
@@ -159,6 +168,7 @@ def cls_top1_accuracy(preds: np.ndarray, labels: np.ndarray) -> float:
         return float("nan")
     return float((preds == labels).mean())
 
+
 def cls_macro_f1(preds: np.ndarray, labels: np.ndarray) -> float:
     if preds.size == 0 or labels.size == 0:
         return float("nan")
@@ -174,6 +184,140 @@ def cls_ece_from_logits(logits: Tensor, labels: Tensor) -> float:
         y = labels[valid].detach().cpu().numpy()
         return expected_calibration_error(p, y)
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, gamma: float = 2.0, weight: Optional[Tensor] = None, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, logits: Tensor, target: Tensor) -> Tensor:
+        logpt = torch.nn.functional.log_softmax(logits, dim=-1)
+        pt = torch.exp(logpt)
+        logpt = logpt.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+        pt = pt.gather(dim=-1, index=target.unsqueeze(-1)).squeeze(-1)
+        loss = -((1 - pt) ** self.gamma) * logpt
+        if self.weight is not None:
+            w = self.weight.gather(0, target)
+            loss = loss * w
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+def build_warmup_cosine_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_mult: float = 0.0,
+) -> LambdaLR:
+
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+
+    def lr_lambda(step: int):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_mult + (1.0 - min_lr_mult) * cosine
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+class EMAWeights:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow: Dict[str, Tensor] = {}
+        self.backup: Dict[str, Tensor] = {}
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            assert name in self.shadow
+            self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: torch.nn.Module):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            self.backup[name] = p.detach().clone()
+            p.data.copy_(self.shadow[name].data)
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module):
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name in self.backup:
+                p.data.copy_(self.backup[name].data)
+        self.backup = {}
+
+def compute_class_weights(
+    labels: torch.Tensor,
+    num_classes: int | None = None,
+    *,
+    method: str = "effective_num",  
+    beta: float = 0.9999,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    labels = labels.view(-1).to(torch.long)
+    if num_classes is None:
+        num_classes = int(labels.max().item()) + 1 if labels.numel() > 0 else 0
+    counts = torch.bincount(labels, minlength=num_classes).float()
+
+    if num_classes == 0:
+        return torch.tensor([], dtype=torch.float32)
+
+    if method == "freq_inv":
+        w = 1.0 / (counts + eps)
+        w = w * (num_classes / (w.sum() + eps))
+        return w
+
+    if method == "effective_num":
+        beta_t = torch.tensor(beta, dtype=torch.float32)
+        effective_num = 1.0 - torch.pow(beta_t, counts)
+        w = (1.0 - beta_t) / (effective_num + eps)
+        w = w * (num_classes / (w.sum() + eps))
+        return w
+
+    raise ValueError(f"Unknown method={method!r}. Use 'effective_num' or 'freq_inv'.")
+
+def compute_class_weights_from_loader(
+    dataloader,
+    *,
+    label_key: str = "labels",
+    num_classes: int | None = None,
+    method: str = "effective_num",
+    beta: float = 0.9999,
+    eps: float = 1e-8,
+    device: str | torch.device | None = None,
+) -> torch.Tensor:
+    all_labels = []
+    for batch in dataloader:
+        if label_key not in batch:
+            continue
+        y = batch[label_key]
+        if torch.is_tensor(y):
+            all_labels.append(y.detach().view(-1).to(torch.long).cpu())
+    if not all_labels:
+        return torch.tensor([], dtype=torch.float32)
+    labels = torch.cat(all_labels, dim=0)
+    w = compute_class_weights(labels, num_classes=num_classes, method=method, beta=beta, eps=eps)
+    if device is not None:
+        w = w.to(device)
+    return w
+
+get_class_weights = compute_class_weights
 
 def _unpack_single_stream(batch: Dict[str, Tensor], device: torch.device) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     x = batch["input_ids"].to(device)
@@ -197,7 +341,6 @@ def _unpack_dual_stream(batch: Dict[str, Tensor], device: torch.device) -> Dict[
     if "motif_flags" in batch and batch["motif_flags"] is not None:
         out["motif_flags"] = batch["motif_flags"].to(device)
     return out
-
 
 def _encode_any(
     model: torch.nn.Module,
@@ -247,7 +390,6 @@ def _forward_dual(
     )
     return head(encoded) if head is not None else encoded
 
-
 def _pick_dual_labels(b: dict, stream_name: str) -> Tuple[torch.Tensor, str]:
     stream = (stream_name or "kmer").lower()
     for key in (f"labels_{stream}", "labels_kmer", "labels_bpe"):
@@ -256,14 +398,12 @@ def _pick_dual_labels(b: dict, stream_name: str) -> Tuple[torch.Tensor, str]:
             return t, key
     raise ValueError("Dual-stream batch is missing 'labels_kmer'/'labels_bpe'.")
 
-
 def _compute_loss_and_basic_counts(
     logits: Tensor,
     labels: Tensor,
     criterion: torch.nn.Module,
     attention_mask: Optional[Tensor] = None,
 ) -> Tuple[Tensor, int, int, int, Tensor, Tensor]:
-  
     if logits.dim() == 3 and labels.dim() == 2:
         V = logits.size(-1)
         mask = (labels != -100)
@@ -274,7 +414,7 @@ def _compute_loss_and_basic_counts(
         if attention_mask is not None:
             batch_valid = int(attention_mask.long().sum().item())
         else:
-            batch_valid = int((labels != -100).numel()) 
+            batch_valid = int((labels != -100).numel())
         batch_correct = int(((preds == labels) & mask).sum().item())
         return loss, batch_masked, batch_valid, batch_correct, preds, probs
 
@@ -294,6 +434,7 @@ def _compute_loss_and_basic_counts(
         "Use a token-level head (B,L,V) with token labels (B,L), "
         "or a sequence-level head (B,C) with sequence labels (B)."
     )
+
 
 def _aggregate_selfsup_metrics(
     avg_loss: float,
@@ -328,7 +469,6 @@ def _aggregate_selfsup_metrics(
         )
         try:
             cm_mask = labels_concat >= 0
-            from sklearn.metrics import confusion_matrix
             conf_mat = confusion_matrix(labels_concat[cm_mask], preds_concat[cm_mask]) if np.any(cm_mask) else None
         except Exception:
             conf_mat = None
@@ -434,7 +574,6 @@ def _select_top5_for_task(task: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
                 "alignment_uniformity": metrics.get("alignment_uniformity", float("nan"))}
     return {"loss": loss, "accuracy": acc, "perplexity": ppl, "entropy_mean": ent, "expected_calibration_error": ece}
 
-
 def train(
     model: torch.nn.Module,
     head: Optional[torch.nn.Module],
@@ -450,6 +589,9 @@ def train(
     dual_stream: bool = False,
     collect_selfsup_extras: Optional[bool] = None,
     task: Optional[str] = None,
+    *,
+    mixed_precision: bool = False,
+    scaler: Optional[GradScaler] = None,
 ) -> Dict[str, float]:
     task = (task or PRETRAIN_TASK).lower()
     model.train()
@@ -470,26 +612,52 @@ def train(
     all_labels: List[Tensor] = []
     all_probs: List[np.ndarray] = []
 
+    use_amp = bool(mixed_precision and torch.cuda.is_available())
+    scaler = scaler if scaler is not None else GradScaler(enabled=use_amp)
+
     for batch_idx, batch in enumerate(dataloader):
         optimizer.zero_grad(set_to_none=True)
 
         if dual_stream:
             b = _unpack_dual_stream(batch, device)
-            logits = _forward_dual(model.encoder if hasattr(model, "encoder") else model, head, b)
-            labels, label_key = _pick_dual_labels(b, SELF_SUP_STREAM)
-            attention_mask = b.get("kmer_attention_mask") if label_key == "labels_kmer" else b.get("bpe_attention_mask")
+            with autocast(enabled=use_amp):
+                logits = _forward_dual(model.encoder if hasattr(model, "encoder") else model, head, b)
+                labels, label_key = _pick_dual_labels(b, SELF_SUP_STREAM)
+                attention_mask = b.get("kmer_attention_mask") if label_key == "labels_kmer" else b.get("bpe_attention_mask")
+                if criterion is None:
+                    raise ValueError("criterion is required for training.")
+                loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
+                    logits, labels, criterion, attention_mask
+                )
         else:
             x, attention_mask, position_ids, labels = _unpack_single_stream(batch, device)
             motif_flags = batch.get("motif_flags")
             motif_flags = motif_flags.to(device) if motif_flags is not None else None
-            logits = _forward_single(model, head, x, attention_mask, position_ids, motif_flags)
+            with autocast(enabled=use_amp):
+                logits = _forward_single(model, head, x, attention_mask, position_ids, motif_flags)
+                if criterion is None or labels is None:
+                    raise ValueError("criterion and labels are required for training.")
+                loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
+                    logits, labels, criterion, attention_mask
+                )
 
-        if criterion is None or labels is None:
-            raise ValueError("criterion and labels are required for training.")
-
-        loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
-            logits, labels, criterion, attention_mask
-        )
+        if use_amp:
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(p for p in model.parameters() if p.requires_grad) +
+                ([] if head is None else [p for p in head.parameters() if p.requires_grad]),
+                max_norm=1.0
+            )
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(p for p in model.parameters() if p.requires_grad) +
+                ([] if head is None else [p for p in head.parameters() if p.requires_grad]),
+                max_norm=1.0
+            )
+            optimizer.step()
 
         total_correct       += batch_correct
         total_masked_tokens += batch_masked
@@ -518,13 +686,6 @@ def train(
                     seq_with_corr += int(row_has_corr.sum().item())
                     seq_full_correct += int((row_all_corr_correct & row_has_corr).sum().item())
 
-        loss.backward()
-        params = list(p for p in model.parameters() if p.requires_grad)
-        if head is not None:
-            params += [p for p in head.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-        optimizer.step()
-
     avg_loss = total_loss / max(1, total_masked_tokens)
     accuracy = total_correct / max(1, total_masked_tokens)
 
@@ -556,8 +717,9 @@ def train(
         metrics["seq_reconstruction_rate"] = (seq_full_correct / max(1, seq_with_corr)) if seq_with_corr > 0 else float("nan")
 
     metrics["task_top5"] = _select_top5_for_task(task, metrics)
-    return metrics 
+    return metrics
 
+@torch.no_grad()
 def evaluate(
     model: torch.nn.Module,
     head: Optional[torch.nn.Module],
@@ -571,8 +733,16 @@ def evaluate(
     dual_stream: bool = False,
     collect_selfsup_extras: Optional[bool] = None,
     task: Optional[str] = None,
+    *,
+    EMAWeights: Optional[EMAWeights] = None,
+    use_EMAWeights_for_eval: bool = False,
+    mixed_precision: bool = False,
 ) -> Dict[str, float]:
     task = (task or PRETRAIN_TASK).lower()
+
+    if EMAWeights is not None and use_EMAWeights_for_eval:
+        EMAWeights.apply_shadow(model)
+
     model.eval()
     if head is not None:
         head.eval()
@@ -591,49 +761,55 @@ def evaluate(
     all_labels: List[Tensor] = []
     all_probs: List[np.ndarray] = []
 
-    with torch.no_grad():
-        for batch in dataloader:
-            if dual_stream:
-                b = _unpack_dual_stream(batch, device)
+    use_amp = bool(mixed_precision and torch.cuda.is_available())
+
+    for batch in dataloader:
+        if dual_stream:
+            b = _unpack_dual_stream(batch, device)
+            with autocast(enabled=use_amp):
                 logits = _forward_dual(model.encoder if hasattr(model, "encoder") else model, head, b)
                 labels, label_key = _pick_dual_labels(b, SELF_SUP_STREAM)
                 attention_mask = b.get("kmer_attention_mask") if label_key == "labels_kmer" else b.get("bpe_attention_mask")
-            else:
-                x, attention_mask, position_ids, labels = _unpack_single_stream(batch, device)
-                motif_flags = batch.get("motif_flags")
-                motif_flags = motif_flags.to(device) if motif_flags is not None else None
+                if criterion is None:
+                    raise ValueError("criterion is required for evaluation.")
+                loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
+                    logits, labels, criterion, attention_mask
+                )
+        else:
+            x, attention_mask, position_ids, labels = _unpack_single_stream(batch, device)
+            motif_flags = batch.get("motif_flags")
+            motif_flags = motif_flags.to(device) if motif_flags is not None else None
+            with autocast(enabled=use_amp):
                 logits = _forward_single(model, head, x, attention_mask, position_ids, motif_flags)
+                if criterion is None or labels is None:
+                    raise ValueError("criterion and labels are required for evaluation.")
+                loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
+                    logits, labels, criterion, attention_mask
+                )
 
-            if criterion is None or labels is None:
-                raise ValueError("criterion and labels are required for evaluation.")
+        total_correct       += batch_correct
+        total_masked_tokens += batch_masked
+        total_valid_tokens  += batch_valid
+        total_loss          += float(loss.item()) * max(1, batch_masked)
 
-            loss, batch_masked, batch_valid, batch_correct, preds, probs = _compute_loss_and_basic_counts(
-                logits, labels, criterion, attention_mask
-            )
+        if logits.dim() == 3 and labels.dim() == 2:
+            mask = (labels != -100)
+            if mask.any():
+                all_preds.append(preds[mask].cpu())
+                all_labels.append(labels[mask].cpu())
+                all_probs.append(probs[mask].cpu().numpy())
 
-            total_correct       += batch_correct
-            total_masked_tokens += batch_masked
-            total_valid_tokens  += batch_valid
-            total_loss          += float(loss.item()) * max(1, batch_masked)
-
-            if logits.dim() == 3 and labels.dim() == 2:
-                mask = (labels != -100)
-                if mask.any():
-                    all_preds.append(preds[mask].cpu())
-                    all_labels.append(labels[mask].cpu())
-                    all_probs.append(probs[mask].cpu().numpy())
-
-            if task in ("dae", "span", "kmer_reorder") and logits.dim() == 3 and labels.dim() == 2:
-                valid_bool = (attention_mask.long() > 0) if attention_mask is not None else torch.ones_like(labels, dtype=torch.bool)
-                corrupted = (x != labels) & valid_bool if not dual_stream else torch.zeros_like(labels, dtype=torch.bool)
-                if corrupted.numel() > 0:
-                    dae_total_corrupted += int(corrupted.sum().item())
-                    dae_total_corrupted_correct += int(((preds == labels) & corrupted).sum().item())
-                    if corrupted.dim() == 2:
-                        row_has_corr = corrupted.any(dim=1)
-                        row_all_corr_correct = ((preds == labels) | (~corrupted)).all(dim=1)
-                        seq_with_corr += int(row_has_corr.sum().item())
-                        seq_full_correct += int((row_all_corr_correct & row_has_corr).sum().item())
+        if task in ("dae", "span", "kmer_reorder") and logits.dim() == 3 and labels.dim() == 2:
+            valid_bool = (attention_mask.long() > 0) if attention_mask is not None else torch.ones_like(labels, dtype=torch.bool)
+            corrupted = (x != labels) & valid_bool if not dual_stream else torch.zeros_like(labels, dtype=torch.bool)
+            if corrupted.numel() > 0:
+                dae_total_corrupted += int(corrupted.sum().item())
+                dae_total_corrupted_correct += int(((preds == labels) & corrupted).sum().item())
+                if corrupted.dim() == 2:
+                    row_has_corr = corrupted.any(dim=1)
+                    row_all_corr_correct = ((preds == labels) | (~corrupted)).all(dim=1)
+                    seq_with_corr += int(row_has_corr.sum().item())
+                    seq_full_correct += int((row_all_corr_correct & row_has_corr).sum().item())
 
     avg_loss = total_loss / max(1, total_masked_tokens)
     accuracy = total_correct / max(1, total_masked_tokens)
@@ -666,10 +842,11 @@ def evaluate(
         metrics["seq_reconstruction_rate"] = (seq_full_correct / max(1, seq_with_corr)) if seq_with_corr > 0 else float("nan")
 
     metrics["task_top5"] = _select_top5_for_task(task, metrics)
-    return metrics 
 
-def _encode_any_cls(model, x, attention_mask=None, motif_flags=None, position_ids=None) -> Tensor:
-    return _encode_any(model, x, attention_mask, motif_flags, position_ids)
+    if EMAWeights is not None and use_EMAWeights_for_eval:
+        EMAWeights.restore(model)
+
+    return metrics
 
 def supervised_contrastive_loss(z: Tensor, y: Tensor, temperature: float = 0.07) -> Tensor:
     z = torch.nn.functional.normalize(z, dim=-1)
@@ -687,6 +864,7 @@ def supervised_contrastive_loss(z: Tensor, y: Tensor, temperature: float = 0.07)
         return torch.zeros((), device=device)
     return -pos_log_prob.mean()
 
+
 def train_cls_ce_supcon_epoch(
     model: torch.nn.Module,
     head_cls: torch.nn.Module,
@@ -697,8 +875,16 @@ def train_cls_ce_supcon_epoch(
     ce_weight: float = 1.0,
     supcon_weight: float = 1.0,
     temperature: float = 0.07,
+    *,
+    mixed_precision: bool = False,
+    scaler: Optional[GradScaler] = None,
+    focal_loss: bool = False,
+    class_weights: Optional[Tensor] = None,
 ) -> Dict[str, Any]:
     model.train(); head_cls.train(); cml_head.train()
+
+    use_amp = bool(mixed_precision and torch.cuda.is_available())
+    scaler = scaler if scaler is not None else GradScaler(enabled=use_amp)
 
     all_logits: List[Tensor] = []
     all_labels: List[Tensor] = []
@@ -706,34 +892,50 @@ def train_cls_ce_supcon_epoch(
     ce_losses: List[float] = []
     supcon_losses: List[float] = []
 
+    if focal_loss:
+        ce_crit = FocalLoss(gamma=2.0, weight=class_weights.to(device) if class_weights is not None else None)
+    else:
+        ce_crit = torch.nn.CrossEntropyLoss(weight=class_weights.to(device) if class_weights is not None else None)
+
     for batch in dataloader:
-        x = batch.get("input_ids", batch.get("kmer_input_ids")).to(device)
-        am = batch.get("attention_mask", batch.get("kmer_attention_mask"))
+        x = (batch.get("input_ids") or batch.get("kmer_input_ids")).to(device)
+        am = batch.get("attention_mask") or batch.get("kmer_attention_mask")
         if am is not None: am = am.to(device)
         y = batch["labels"].to(device)
 
-        enc = _encode_any_cls(model, x, attention_mask=am)
-        logits = head_cls(enc)
-        loss_ce = torch.nn.functional.cross_entropy(logits, y)
-
-        v1 = batch["input_ids_view1"].to(device)
-        v2 = batch["input_ids_view2"].to(device)
-        am1 = batch["attention_mask_view1"].to(device)
-        am2 = batch["attention_mask_view2"].to(device)
-
-        z1 = cml_head(_encode_any_cls(model, v1, attention_mask=am1))
-        z2 = cml_head(_encode_any_cls(model, v2, attention_mask=am2))
-        z = torch.cat([z1, z2], dim=0)
-        y2 = torch.cat([y, y], dim=0)
-
-        loss_supcon = supervised_contrastive_loss(z, y2, temperature=temperature)
-
-        loss = ce_weight * loss_ce + supcon_weight * loss_supcon
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head_cls.parameters()) + list(cml_head.parameters()), 1.0)
-        optimizer.step()
+
+        with autocast(enabled=use_amp):
+            enc = _encode_any(model, x, attention_mask=am)
+            logits = head_cls(enc)
+            loss_ce = ce_crit(logits, y)
+
+            v1 = batch["input_ids_view1"].to(device)
+            v2 = batch["input_ids_view2"].to(device)
+            am1 = batch["attention_mask_view1"].to(device)
+            am2 = batch["attention_mask_view2"].to(device)
+
+            z1 = cml_head(_encode_any(model, v1, attention_mask=am1))
+            z2 = cml_head(_encode_any(model, v2, attention_mask=am2))
+            z = torch.cat([z1, z2], dim=0)
+            y2 = torch.cat([y, y], dim=0)
+
+            loss_supcon = supervised_contrastive_loss(z, y2, temperature=temperature)
+            loss = ce_weight * loss_ce + supcon_weight * loss_supcon
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(head_cls.parameters()) + list(cml_head.parameters()), 1.0
+            )
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(head_cls.parameters()) + list(cml_head.parameters()), 1.0
+            )
+            optimizer.step()
 
         all_logits.append(logits.detach())
         all_labels.append(y.detach())
@@ -767,7 +969,7 @@ def train_cls_ce_supcon_epoch(
 def eval_cls_ce_supcon_epoch(
     model: torch.nn.Module,
     head_cls: torch.nn.Module,
-    cml_head: torch.nn.Module, 
+    cml_head: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
 ) -> Dict[str, Any]:
@@ -777,12 +979,12 @@ def eval_cls_ce_supcon_epoch(
     all_labels: List[Tensor] = []
 
     for batch in dataloader:
-        x = batch.get("input_ids", batch.get("kmer_input_ids")).to(device)
-        am = batch.get("attention_mask", batch.get("kmer_attention_mask"))
+        x = (batch.get("input_ids") or batch.get("kmer_input_ids")).to(device)
+        am = batch.get("attention_mask") or batch.get("kmer_attention_mask")
         if am is not None: am = am.to(device)
         y = batch["labels"].to(device)
 
-        enc = _encode_any_cls(model, x, attention_mask=am)
+        enc = _encode_any(model, x, attention_mask=am)
         logits = head_cls(enc)
 
         all_logits.append(logits.detach())
@@ -810,6 +1012,7 @@ def eval_cls_ce_supcon_epoch(
     out["task_top5"] = _select_top5_for_task("ce_supcon", out)
     return out
 
+
 @torch.no_grad()
 def _cosine_stats(z1: Tensor, z2: Tensor) -> Tuple[float, float]:
     pos_cos = torch.nn.functional.cosine_similarity(z1, z2, dim=-1)
@@ -832,39 +1035,53 @@ def train_cml_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     temperature: float = 0.07,
+    *,
+    mixed_precision: bool = False,
+    scaler: Optional[GradScaler] = None,
 ) -> Dict[str, Any]:
     model.train(); cml_head.train()
+
+    use_amp = bool(mixed_precision and torch.cuda.is_available())
+    scaler = scaler if scaler is not None else GradScaler(enabled=use_amp)
 
     all_pos = []; all_neg = []; all_norms = []; losses = []
 
     for batch in dataloader:
-        x1 = batch.get("input_ids", batch.get("kmer_input_ids")).to(device)
+        x1 = (batch.get("input_ids") or batch.get("kmer_input_ids")).to(device)
         x2 = batch.get("input_ids_view2").to(device) if "input_ids_view2" in batch else x1.clone()
         am1 = batch.get("attention_mask") or batch.get("kmer_attention_mask")
         am2 = batch.get("attention_mask_view2")
         if am1 is not None: am1 = am1.to(device)
         if am2 is not None: am2 = am2.to(device)
 
-        z1 = cml_head(_encode_any(model, x1, attention_mask=am1))
-        z2 = cml_head(_encode_any(model, x2, attention_mask=am2))
-
-        z1 = torch.nn.functional.normalize(z1, dim=-1)
-        z2 = torch.nn.functional.normalize(z2, dim=-1)
-        z = torch.cat([z1, z2], dim=0)
-        y = torch.arange(z1.size(0), device=z.device).repeat(2)
-
-        sim = torch.matmul(z, z.t()) / max(temperature, 1e-8)
-        N = z.size(0)
-        self_mask = torch.eye(N, dtype=torch.bool, device=z.device)
-        sim = sim.masked_fill(self_mask, -1e9)
-        pos_mask = (y.unsqueeze(0) == y.unsqueeze(1)) & (~self_mask)
-        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-        loss = -(log_prob[pos_mask]).mean()
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(cml_head.parameters()), 1.0)
-        optimizer.step()
+
+        with autocast(enabled=use_amp):
+            z1 = cml_head(_encode_any(model, x1, attention_mask=am1))
+            z2 = cml_head(_encode_any(model, x2, attention_mask=am2))
+
+            z1 = torch.nn.functional.normalize(z1, dim=-1)
+            z2 = torch.nn.functional.normalize(z2, dim=-1)
+            z = torch.cat([z1, z2], dim=0)
+            y = torch.arange(z1.size(0), device=z.device).repeat(2)
+
+            sim = torch.matmul(z, z.t()) / max(temperature, 1e-8)
+            N = z.size(0)
+            self_mask = torch.eye(N, dtype=torch.bool, device=z.device)
+            sim = sim.masked_fill(self_mask, -1e9)
+            pos_mask = (y.unsqueeze(0) == y.unsqueeze(1)) & (~self_mask)
+            log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+            loss = -(log_prob[pos_mask]).mean()
+
+        if use_amp:
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(cml_head.parameters()), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(cml_head.parameters()), 1.0)
+            optimizer.step()
 
         losses.append(float(loss.item()))
         pos_mean, neg_mean = _cosine_stats(z1, z2)
@@ -894,7 +1111,7 @@ def eval_cml_epoch(
     all_pos = []; all_neg = []; all_norms = []
 
     for batch in dataloader:
-        x1 = batch.get("input_ids", batch.get("kmer_input_ids")).to(device)
+        x1 = (batch.get("input_ids") or batch.get("kmer_input_ids")).to(device)
         x2 = batch.get("input_ids_view2").to(device) if "input_ids_view2" in batch else x1.clone()
         am1 = batch.get("attention_mask") or batch.get("kmer_attention_mask")
         am2 = batch.get("attention_mask_view2")
@@ -918,3 +1135,84 @@ def eval_cml_epoch(
     }
     metrics["task_top5"] = _select_top5_for_task("cml", metrics)
     return metrics
+
+def promotion_gate_satisfied(
+    prev_metrics: Dict[str, Any],
+    curr_metrics: Dict[str, Any],
+    gates: Dict[str, Any],
+) -> Tuple[bool, Dict[str, Any]]:
+    
+    def _get(m, k, default=float("nan")):
+        v = m.get(k, default)
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    acc_min = float(gates.get("masked_accuracy_min_delta", 0.02))
+    ece_max = float(gates.get("ece_max_delta", -0.01))             
+    rec_min = float(gates.get("reconstruction_min_delta", 0.02))
+    ent_eps = float(gates.get("entropy_stability_eps", 0.01))
+    need_two = bool(gates.get("require_any_two", True))
+
+    prev_acc = _get(prev_metrics, "accuracy", float("nan"))
+    curr_acc = _get(curr_metrics, "accuracy", float("nan"))
+
+    prev_ece = _get(prev_metrics, "expected_calibration_error", float("nan"))
+    curr_ece = _get(curr_metrics, "expected_calibration_error", float("nan"))
+
+    prev_recon = _get(prev_metrics, "seq_reconstruction_rate", float("nan"))
+    curr_recon = _get(curr_metrics, "seq_reconstruction_rate", float("nan"))
+
+    prev_ent = _get(prev_metrics, "avg_token_entropy", _get(prev_metrics, "entropy_mean", float("nan")))
+    curr_ent = _get(curr_metrics, "avg_token_entropy", _get(curr_metrics, "entropy_mean", float("nan")))
+
+    d_acc  = curr_acc  - prev_acc  if (not math.isnan(curr_acc)  and not math.isnan(prev_acc))  else float("nan")
+    d_ece  = curr_ece  - prev_ece  if (not math.isnan(curr_ece)  and not math.isnan(prev_ece))  else float("nan")
+    d_rec  = curr_recon - prev_recon if (not math.isnan(curr_recon) and not math.isnan(prev_recon)) else float("nan")
+    d_ent  = curr_ent  - prev_ent  if (not math.isnan(curr_ent)  and not math.isnan(prev_ent))  else float("nan")
+
+    c_acc  = (not math.isnan(d_acc)) and (d_acc >= acc_min)
+    c_ece  = (not math.isnan(d_ece)) and (d_ece <= ece_max)        
+    c_rec  = (not math.isnan(d_rec)) and (d_rec >= rec_min)
+    c_ent  = (not math.isnan(d_ent)) and (abs(d_ent) <= ent_eps)  
+
+    satisfied = [c_acc, c_ece, c_rec, c_ent]
+    num_ok = sum(1 for c in satisfied if c)
+
+    passed = (num_ok >= 2) if need_two else any(satisfied)
+
+    details = {
+        "deltas": {
+            "accuracy": d_acc,
+            "ece": d_ece,
+            "seq_reconstruction_rate": d_rec,
+            "avg_token_entropy": d_ent,
+        },
+        "criteria": {
+            "accuracy_up": c_acc,
+            "ece_down": c_ece,
+            "reconstruction_up": c_rec,
+            "entropy_stable": c_ent,
+        },
+        "num_satisfied": num_ok,
+        "require_any_two": need_two,
+        "passed": passed,
+    }
+    return passed, details
+
+
+def gate_summary(details: Dict[str, Any]) -> str:
+    """
+    Pretty string for logs/dashboards.
+    """
+    d = details.get("deltas", {})
+    c = details.get("criteria", {})
+    return (
+        f"[gate] satisfied={details.get('num_satisfied', 0)} "
+        f"(need_two={details.get('require_any_two', True)} => passed={details.get('passed', False)}) | "
+        f"acc={d.get('accuracy')} (ok={c.get('accuracy_up')}), "
+        f"ECE={d.get('ece')} (ok={c.get('ece_down')}), "
+        f"recon={d.get('seq_reconstruction_rate')} (ok={c.get('reconstruction_up')}), "
+        f"entropy={d.get('avg_token_entropy')} (ok={c.get('entropy_stable')})"
+    )
