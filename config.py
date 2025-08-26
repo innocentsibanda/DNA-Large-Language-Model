@@ -136,6 +136,41 @@ USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
 USE_CLASS_WEIGHTS = True 
 
+ADAPTER_ENABLE    = False     
+ADAPTER_R         = 16        
+ADAPTER_DIM       = ADAPTER_R 
+ADAPTER_SCALING   = 1.0       
+ADAPTER_NONLINEAR = "relu"    
+ADAPTER_DROPOUT   = 0.0
+
+LORA_ENABLE = False
+LORA_R      = 8
+LORA_ALPHA  = 16
+LORA_DROPOUT = 0.0
+
+LORA_TARGETS = [
+    "encoder.layers",                
+    "self_attn.in_proj_weight",      
+    "self_attn.out_proj",           
+    "linear1",                       
+    "linear2",                       
+    "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+    "attn_q", "attn_k", "attn_v", "attn_out",
+    "ffn_in", "ffn_out",
+]
+
+
+STAGE_GATES = {
+
+    "masked_accuracy_min_delta": 0.02, 
+    "ece_max_delta":           -0.01,   
+    "reconstruction_min_delta": 0.02,  
+    "entropy_stability_eps":    0.01,   
+    "require_any_two":          True,  
+}
+
+CURRICULUM_ORDER = ["rna_full", "ribo_full", "ribo_partial"]
+
 # Extra epochs for new stages
 EPOCHS_STAGE2 = 3     
 EPOCHS_STAGE3 = 3     
