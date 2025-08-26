@@ -1,6 +1,5 @@
 # model
 from __future__ import annotations
-
 import torch
 import torch.nn as nn
 
@@ -16,9 +15,18 @@ from config import (
     POSITIONAL_EMBEDDING_TYPE,
     MOTIF_VOCAB_SIZE,
     PROJECTION_DIM,
+    ADAPTER_ENABLE,
+    ADAPTER_DIM,
+    ADAPTER_NONLINEAR,
+    LORA_ENABLE,
+    LORA_R,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_TARGETS,
 )
 
 from embeddings import TokenPositionMotifEmbedding
+from adapters import inject_adapters_into_encoder, wrap_lora_in_encoder_layers
 
 
 class SimpleEncoder(nn.Module):
@@ -45,18 +53,48 @@ class SimpleEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=NUM_LAYERS)
 
+        self._adapters_enabled = False
+        self._lora_enabled = False
+
+    def enable_adapters(self, bottleneck: int = ADAPTER_DIM, nonlinearity: str = ADAPTER_NONLINEAR):
+        if not self._adapters_enabled:
+            inject_adapters_into_encoder(self.encoder, EMBED_DIM, bottleneck, nonlinearity)
+            self._adapters_enabled = True
+
+    def enable_lora(self, r: int = LORA_R, alpha: int = LORA_ALPHA, dropout: float = LORA_DROPOUT, targets=LORA_TARGETS):
+        if not self._lora_enabled:
+            wrap_lora_in_encoder_layers(self.encoder, targets=targets, r=r, alpha=alpha, dropout=dropout)
+            self._lora_enabled = True
+
+    def freeze_all(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze_top_n_layers(self, n: int):
+        if n <= 0:
+            return
+        
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                for p in m.parameters():
+                    p.requires_grad_(True)
+
+        for layer in list(self.encoder.layers)[-n:]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
+
     def forward(
         self,
-        x: torch.Tensor,                             
-        attention_mask: torch.Tensor | None = None,   
-        motif_flags: torch.Tensor | None = None,     
-        position_ids: torch.Tensor | None = None,    
+        x: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        motif_flags: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if attention_mask is None:
             src_key_padding_mask = (x == PAD_TOKEN_ID)
         else:
             src_key_padding_mask = (attention_mask == 0)
-        src_key_padding_mask = src_key_padding_mask.bool() 
+        src_key_padding_mask = src_key_padding_mask.bool()
 
         embeddings = self.embedding(
             x,
@@ -66,12 +104,10 @@ class SimpleEncoder(nn.Module):
         )
         embeddings = self.embedding_dropout(embeddings)
 
-        encoded = self.encoder(
-            embeddings,
-            src_key_padding_mask=src_key_padding_mask, 
-        )  
-        return encoded
-
+        enc_out = self.encoder(embeddings, src_key_padding_mask=src_key_padding_mask)
+        if hasattr(self.encoder.layers[0], "adapter"):
+            pass
+        return enc_out
 
 class DualStreamEncoder(nn.Module):
     def __init__(
@@ -79,7 +115,7 @@ class DualStreamEncoder(nn.Module):
         kmer_vocab_size: int,
         bpe_vocab_size: int,
         motif_vocab_size: int = MOTIF_VOCAB_SIZE,
-        fusion: str = "sum",        
+        fusion: str = "sum",
         embed_dim: int = EMBED_DIM,
     ):
         super().__init__()
@@ -100,7 +136,7 @@ class DualStreamEncoder(nn.Module):
             embedding_dim=embed_dim,
             pad_token_id=PAD_TOKEN_ID,
             positional_type=POSITIONAL_EMBEDDING_TYPE,
-            motif_vocab_size=1, 
+            motif_vocab_size=1,
         )
 
         self.dropout = nn.Dropout(DROPOUT)
@@ -119,6 +155,34 @@ class DualStreamEncoder(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=NUM_LAYERS)
+
+        self._adapters_enabled = False
+        self._lora_enabled = False
+
+    def enable_adapters(self, bottleneck: int = ADAPTER_DIM, nonlinearity: str = ADAPTER_NONLINEAR):
+        if not self._adapters_enabled:
+            inject_adapters_into_encoder(self.encoder, EMBED_DIM, bottleneck, nonlinearity)
+            self._adapters_enabled = True
+
+    def enable_lora(self, r: int = LORA_R, alpha: int = LORA_ALPHA, dropout: float = LORA_DROPOUT, targets=LORA_TARGETS):
+        if not self._lora_enabled:
+            wrap_lora_in_encoder_layers(self.encoder, targets=targets, r=r, alpha=alpha, dropout=dropout)
+            self._lora_enabled = True
+
+    def freeze_all(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze_top_n_layers(self, n: int):
+        if n <= 0:
+            return
+        for m in self.modules():
+            if isinstance(m, nn.LayerNorm):
+                for p in m.parameters():
+                    p.requires_grad_(True)
+        for layer in list(self.encoder.layers)[-n:]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
 
     def forward(
         self,
@@ -154,12 +218,11 @@ class DualStreamEncoder(nn.Module):
 
         if self.fusion == "sum":
             fused = k_emb + b_emb
-        else: 
+        else:
             fused = torch.cat([k_emb, b_emb], dim=-1)
             fused = self.fuse_proj(fused)
 
         fused = self.dropout(fused)
-
         encoded = self.encoder(fused, src_key_padding_mask=k_pad.bool())
         return encoded
 
@@ -168,18 +231,16 @@ class MLMHead(nn.Module):
     def __init__(self, embedding_dim: int, vocab_size: int):
         super().__init__()
         self.linear = nn.Linear(embedding_dim, vocab_size)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) 
+        return self.linear(x)
 
 
 class MaskedMotifModelingHead(nn.Module):
     def __init__(self, embedding_dim: int, motif_vocab_size: int):
         super().__init__()
         self.linear = nn.Linear(embedding_dim, motif_vocab_size)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) 
+        return self.linear(x)
 
 class ContrastiveMotifLearningHead(nn.Module):
     def __init__(self, embedding_dim: int = EMBED_DIM, projection_dim: int = PROJECTION_DIM):
@@ -189,29 +250,24 @@ class ContrastiveMotifLearningHead(nn.Module):
             nn.ReLU(),
             nn.Linear(projection_dim, projection_dim),
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         cls_embedding = x[:, 0, :]
-        return self.proj(cls_embedding) 
-
+        return self.proj(cls_embedding)
 
 class MotifAnnotatedPretrainingHead(nn.Module):
     def __init__(self, embedding_dim: int, output_dim: int = 1):
         super().__init__()
         self.linear = nn.Linear(embedding_dim, output_dim)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         cls_embedding = x[:, 0, :]
-        return self.linear(cls_embedding) 
-
+        return self.linear(cls_embedding)
 
 class MotifBoundaryPredictionHead(nn.Module):
     def __init__(self, embedding_dim: int):
         super().__init__()
         self.linear = nn.Linear(embedding_dim, 2)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x) 
+        return self.linear(x)
 
 
 class MultiTaskPretrainingModel(nn.Module):
@@ -229,7 +285,17 @@ class MultiTaskPretrainingModel(nn.Module):
         self.mbp_head = MotifBoundaryPredictionHead(EMBED_DIM)
 
         self.embedding = self.encoder.embedding
-        self.embedding_dropout = self.encoder.embedding_dropout 
+        self.embedding_dropout = self.encoder.embedding_dropout
+
+    def freeze_encoder(self, unfreeze_top_n: int = 0):
+        self.encoder.freeze_all()
+        self.encoder.unfreeze_top_n_layers(unfreeze_top_n)
+
+    def enable_adapters(self, bottleneck: int = ADAPTER_DIM, nonlinearity: str = ADAPTER_NONLINEAR):
+        self.encoder.enable_adapters(bottleneck, nonlinearity)
+
+    def enable_lora(self, r: int = LORA_R, alpha: int = LORA_ALPHA, dropout: float = LORA_DROPOUT, targets=LORA_TARGETS):
+        self.encoder.enable_lora(r, alpha, dropout, targets)
 
     def forward(
         self,
@@ -245,7 +311,6 @@ class MultiTaskPretrainingModel(nn.Module):
             motif_flags=motif_flags,
             position_ids=position_ids,
         )
-
         task = task.lower()
         if task == "mlm":
             return self.mlm_head(encoded)
