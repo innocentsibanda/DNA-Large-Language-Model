@@ -112,6 +112,30 @@ EPOCHS = 1
 LEARNING_RATE = 1e-3
 GRAD_CLIP = 1.0
 
+# Stages 5–7 Auxiliary self-supervised loss
+AUX_TASK = "mlm"             # {"mlm","dae","span","kmer_reorder"}
+AUX_LOSS_WEIGHT = 0.1        
+
+# Stage-1  Replay Buffer 
+REPLAY_FRACTION = 0.01    
+
+# Encoder layers freezing for Stages 5–7
+UNFREEZE_TOP_N = 0           # 0 = fully frozen transformer stack except the embeddings layer
+
+MIXED_PRECISION = True      
+USE_EMA = True              
+EMA_DECAY = 0.999
+
+WARMUP_STEPS = 100
+COSINE_TOTAL_STEPS = 1000    
+
+EARLY_STOP_PATIENCE = 5
+
+# Focal loss
+USE_FOCAL_LOSS = False
+FOCAL_GAMMA = 2.0
+USE_CLASS_WEIGHTS = True 
+
 # Extra epochs for new stages
 EPOCHS_STAGE2 = 3     
 EPOCHS_STAGE3 = 3     
@@ -134,10 +158,14 @@ WANDB_ENTITY = None
 WANDB_RUN_NAME = None
 
 # Saving tokenizer paths 
+SAVE_DIR = "."  
 TOKENIZER_SAVE_PATH   = "tokenizer_vocab.json"
 TOKENIZER_BPE_PATH    = "bpe_vocab.json"
 TOKENIZER_HYBRID_PATH = "hybrid_vocab.json"
 TOKENIZER_KMER_PATH   = "kmer_vocab.json"
+STAGE_LOG_PATH = "stage_gates.jsonl"          
+RUN_CONFIG_SNAPSHOT = "config_snapshot.json"  
+TOKENIZER_META_PATH = "tokenizer_meta.json
 
 # Checkpoints per stage
 CKPT_STAGE1A = "stage1a_pretrained.pt"
