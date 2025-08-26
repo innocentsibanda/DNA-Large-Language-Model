@@ -1,15 +1,19 @@
-# Main.py  
+# main
 from __future__ import annotations
 
 import math
+import json
+import time
 import inspect
 import random
-from typing import List, Dict, Any
+import hashlib
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Subset, ConcatDataset
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 import config as cfg
 
@@ -26,10 +30,36 @@ from model import (
     MotifAnnotatedPretrainingHead,
     ContrastiveMotifLearningHead,
 )
-from train_eval import train, evaluate, supervised_contrastive_loss
 
-from partial_datasets import PartialViewDataset
-from pretraining_supervised import cml_augment_random_mask
+
+from train_eval import (
+    train, evaluate,
+    train_cls_ce_supcon_epoch, eval_cls_ce_supcon_epoch,
+    train_cml_epoch, eval_cml_epoch,
+    promotion_gate_satisfied,                    
+    EMAWeights,                                   
+    compute_class_weights,                       
+)
+
+
+AMP_ENABLE = bool(getattr(cfg, "MIXED_PRECISION", True))
+
+
+AUX_TASK = str(getattr(cfg, "AUX_TASK", "mlm"))              
+AUX_WEIGHT = float(getattr(cfg, "AUX_LOSS_WEIGHT", 0.1))     
+REPLAY_FRACTION = float(getattr(cfg, "REPLAY_FRACTION", 0.01))  
+UNFREEZE_TOP_N = int(getattr(cfg, "UNFREEZE_TOP_N", 0))   
+USE_EMA = bool(getattr(cfg, "USE_EMA", True))
+EMA_DECAY = float(getattr(cfg, "EMA_DECAY", 0.999))
+WARMUP_STEPS = int(getattr(cfg, "WARMUP_STEPS", 100))
+COSINE_TOTAL_STEPS = int(getattr(cfg, "COSINE_TOTAL_STEPS", 1000))
+EARLY_STOP_PATIENCE = int(getattr(cfg, "EARLY_STOP_PATIENCE", 5))
+SAVE_DIR = Path(getattr(cfg, "SAVE_DIR", "."))
+
+
+STAGE_LOG_PATH = SAVE_DIR / str(getattr(cfg, "STAGE_LOG_PATH", "stage_gates.jsonl"))
+RUN_CONFIG_SNAPSHOT = SAVE_DIR / str(getattr(cfg, "RUN_CONFIG_SNAPSHOT", "config_snapshot.json"))
+TOKENIZER_META_PATH = SAVE_DIR / str(getattr(cfg, "TOKENIZER_META_PATH", "tokenizer_meta.json"))
 
 def _seed_all(seed: int = 42):
     random.seed(seed)
@@ -38,357 +68,294 @@ def _seed_all(seed: int = 42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def _sample_indices(n: int, fraction: float, seed: int, strategy: str = "first_k") -> list[int]:
-    if fraction >= 1.0 or n == 0:
-        return list(range(n))
-    k = max(1, int(math.ceil(n * max(fraction, 1e-9))))
-    if strategy == "first_k":
-        return list(range(k))
-    rnd = random.Random(seed)
-    return sorted(rnd.sample(range(n), k))
+def _device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def _subsample_dataset(ds, fraction: float, seed: int, strategy: str = "first_k"):
+def _subsample(ds, fraction: float, seed: int, mode: str = "first_k"):
     n = len(ds)
-    if fraction >= 1.0 or n == 0:
+    if fraction >= 1.0 or n <= 1:
         return ds
     k = max(1, int(math.ceil(n * max(fraction, 1e-9))))
-    if strategy == "first_k":
+    if mode == "first_k":
         idx = list(range(k))
     else:
         rnd = random.Random(seed)
         idx = sorted(rnd.sample(range(n), k))
-    from torch.utils.data import Subset
     return Subset(ds, idx)
 
-def _probe_first_batch(loader):
-    if not cfg.PROBE_FIRST_BATCH:
-        return None
-    print("Sanity-check")
-    batch = next(iter(loader))
-    if "input_ids" in batch:
-        masked = int((batch.get("labels", torch.zeros(1)) != -100).sum()) if "labels" in batch else 0
-        print("single-stream batch", batch["input_ids"].shape, "masked:", masked)
-    elif "kmer_input_ids" in batch:
-        print("dual-stream batch")
-        for k in ("kmer_input_ids", "bpe_input_ids", "labels_kmer", "labels_bpe"):
-            if k in batch and isinstance(batch[k], torch.Tensor):
-                print(" ", k, batch[k].shape)
-        if "labels_kmer" in batch:
-            print(" masked kmer:", int((batch["labels_kmer"] != -100).sum()))
-        if "labels_bpe" in batch:
-            print(" masked bpe:", int((batch["labels_bpe"] != -100).sum()))
-    else:
-        print("sequence-classification batch keys:", list(batch.keys()))
-    return batch
+def _save_jsonl(path: Path, obj: Dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-def _save_tokenizer(tokenizer):
-    try:
-        tok_type = getattr(cfg, "TOKENIZER_TYPE", "kmer").lower()
-        if tok_type == "bpe":
-            path = cfg.TOKENIZER_BPE_PATH
-        elif tok_type == "hybrid":
-            path = cfg.TOKENIZER_HYBRID_PATH
-        else:
-            path = cfg.TOKENIZER_KMER_PATH
-        tokenizer.save_vocab(path)
-        print(f"Saved tokenizer vocab to {path}")
-    except Exception as e:
-        print("Warning: failed to save tokenizer vocab:", e)
+def _save_json(path: Path, obj: Dict[str, Any]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _effective_vocab_size_for_token_fusion(tokenizer) -> int:
-    if hasattr(tokenizer, "effective_vocab_size"):
-        try:
-            return int(tokenizer.effective_vocab_size()) 
-        except Exception:
-            pass
+def _snapshot_config():
+    cfg_dict = {k: getattr(cfg, k) for k in dir(cfg) if k.isupper()}
+    _save_json(RUN_CONFIG_SNAPSHOT, cfg_dict)
 
-    kmer_vs = len(getattr(tokenizer, "kmer_tokenizer", type("x", (), {"vocab": {}})).vocab)
-    try:
-        kmer_vs = int(getattr(tokenizer, "kmer_vocab_size", kmer_vs) or kmer_vs)
-    except Exception:
-        pass
-    bpe_vs = len(getattr(tokenizer, "bpe_tokenizer", type("x", (), {"vocab": {}})).vocab)
-    return max(int(kmer_vs) + int(bpe_vs), 0)
+def _sha1_texts(texts: List[str]) -> str:
+    h = hashlib.sha1()
+    for s in texts[:1000]:  
+        h.update(s.encode("utf-8"))
+    return h.hexdigest()
 
-def _dedupe_params(params_iterable):
-    seen = set()
-    out = []
-    for p in params_iterable:
-        if id(p) not in seen:
-            seen.add(id(p))
-            out.append(p)
-    return out
+def _build_optimizer(params, lr: float, weight_decay: float):
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    return opt
 
-def _build_model_and_head(tokenizer, device: torch.device):
+def _build_warmup_cosine_scheduler(optimizer, warmup_steps: int, total_steps: int):
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, max(0.0, progress))))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+def _freeze_encoder_layers(model, unfreeze_top_n: int = 0):
+
+    enc = getattr(model, "encoder", model)
+    for p in enc.parameters():
+        p.requires_grad = False
+
+    stack = getattr(enc, "encoder", None)
+    if stack is None:
+        return  
+    layers = getattr(stack, "layers", None)
+    if layers is None:
+        return
+
+    if unfreeze_top_n > 0:
+        for p in enc.embedding.parameters():
+            p.requires_grad = True  
+        for layer in layers[-unfreeze_top_n:]:
+            for p in layer.parameters():
+                p.requires_grad = True
+
+def _collect_trainable_params(*modules):
+    seen, params = set(), []
+    for m in modules:
+        if m is None: 
+            continue
+        for p in m.parameters():
+            if p.requires_grad and id(p) not in seen:
+                seen.add(id(p)); params.append(p)
+    return params
+
+def _maybe_lock_tokenizer(tokenizer):
+    if hasattr(tokenizer, "train"):
+        tokenizer.train = lambda *args, **kwargs: None 
+    return tokenizer
+
+def _stage_gate_and_log(stage_name: str, prev_metrics: Dict[str, Any], cur_metrics: Dict[str, Any]) -> bool:
+    ok, reasons = promotion_gate_satisfied(prev_metrics, cur_metrics)
+    row = {
+        "ts": time.time(),
+        "stage": stage_name,
+        "promote": bool(ok),
+        "reasons": reasons,
+        "prev_top5": prev_metrics.get("task_top5", {}),
+        "cur_top5": cur_metrics.get("task_top5", {}),
+    }
+    _save_jsonl(STAGE_LOG_PATH, row)
+    return ok
+
+def _build_model_and_head_for_selfsup(tokenizer, device: torch.device) -> Tuple[torch.nn.Module, torch.nn.Module, int, bool, int]:
     tok_type = getattr(cfg, "TOKENIZER_TYPE", "kmer").lower()
     hybrid_mode = getattr(cfg, "HYBRID_MODE", "dual").lower()
     is_dual = (tok_type == "hybrid" and hybrid_mode == "dual")
 
     if is_dual:
-        print("Using DualStreamEncoder (hybrid dual-stream).")
         kmer_vocab = len(tokenizer.kmer_tokenizer.vocab)
         bpe_vocab = len(tokenizer.bpe_tokenizer.vocab)
-
-        dual_encoder = DualStreamEncoder(
-            kmer_vocab_size=kmer_vocab,
-            bpe_vocab_size=bpe_vocab,
-            fusion=getattr(cfg, "DUAL_FUSION", "sum"),
-            embed_dim=cfg.EMBED_DIM,
+        enc = DualStreamEncoder(
+            kmer_vocab_size=kmer_vocab, bpe_vocab_size=bpe_vocab,
+            fusion=getattr(cfg, "DUAL_FUSION", "sum"), embed_dim=cfg.EMBED_DIM
         ).to(device)
-
+        
         stream = getattr(cfg, "SELF_SUP_STREAM", "kmer").lower()
-        if stream not in ("kmer", "bpe"):
-            raise ValueError("cfg.SELF_SUP_STREAM must be 'kmer' or 'bpe' for dual-stream training.")
-        vocab_for_head = kmer_vocab if stream == "kmer" else bpe_vocab
+        head_vocab = kmer_vocab if stream == "kmer" else bpe_vocab
+        head = MLMHead(cfg.EMBED_DIM, head_vocab).to(device)
+        class Wrap(torch.nn.Module):
+            def __init__(self, e): super().__init__(); self.encoder = e
+        model = Wrap(enc).to(device)
+        metrics_vocab = head_vocab
+        return model, head, metrics_vocab, True, head_vocab
 
-        head = MLMHead(embedding_dim=cfg.EMBED_DIM, vocab_size=vocab_for_head).to(device)
-
-        class ModelWrap(torch.nn.Module):
-            def __init__(self, enc):
-                super().__init__()
-                self.encoder = enc
-
-        model = ModelWrap(dual_encoder).to(device)
-        params = _dedupe_params([p for p in model.parameters() if p.requires_grad] +
-                                [p for p in head.parameters() if p.requires_grad])
-        metrics_vocab = vocab_for_head
-        return model, head, params, True, metrics_vocab
-
-    if tok_type == "hybrid" and hybrid_mode == "token":
-        vocab_for_head = _effective_vocab_size_for_token_fusion(tokenizer)
-    else:
-        vocab_for_head = len(tokenizer.vocab)
-
+    vocab_for_head = len(getattr(tokenizer, "vocab", {}))
     try:
-        model = MultiTaskPretrainingModel(
-            vocab_size=vocab_for_head,
-            motif_vocab_size=cfg.MOTIF_VOCAB_SIZE,
-            dual_stream=False,
-        ).to(device)
+        model = MultiTaskPretrainingModel(vocab_size=vocab_for_head, motif_vocab_size=cfg.MOTIF_VOCAB_SIZE).to(device)
         head = model.mlm_head
-        print("MultiTaskPretrainingModel.")
-        params = _dedupe_params([p for p in model.parameters() if p.requires_grad])
     except Exception:
         enc = SimpleEncoder(vocab_size=vocab_for_head, motif_vocab_size=cfg.MOTIF_VOCAB_SIZE).to(device)
-        head = MLMHead(enc.embedding.embedding_dim, vocab_for_head).to(device)
+        head = MLMHead(cfg.EMBED_DIM, vocab_for_head).to(device)
+        class Wrap(torch.nn.Module):
+            def __init__(self, e): super().__init__(); self.encoder = e
+        model = Wrap(enc).to(device)
+    return model, head, vocab_for_head, False, vocab_for_head
 
-        class ModelWrap(torch.nn.Module):
-            def __init__(self, enc):
-                super().__init__()
-                self.encoder = enc
+def _build_aux_head(model, aux_task: str, vocab_size: int) -> torch.nn.Module:
+    aux = aux_task.lower()
+    if aux == "mlm" or aux == "dae" or aux == "span" or aux == "kmer_reorder":
+        return MLMHead(cfg.EMBED_DIM, vocab_size).to(next(model.parameters()).device)
+    if aux == "masked_motif":
+        return MaskedMotifModelingHead(cfg.EMBED_DIM, cfg.MOTIF_VOCAB_SIZE).to(next(model.parameters()).device)
+    return MLMHead(cfg.EMBED_DIM, vocab_size).to(next(model.parameters()).device)
 
-        model = ModelWrap(enc)
-        print("Fallback: SimpleEncoder + MLMHead.")
-        params = _dedupe_params([p for p in model.parameters() if p.requires_grad] +
-                                [p for p in head.parameters() if p.requires_grad])
+def _aux_step_selfsup(
+    model, aux_head, aux_loader, criterion, device, vocab_size, kmer_size, ambiguous_token_id, task
+) -> Dict[str, Any]:
+    return train(
+        model, aux_head, aux_loader,
+        optimizer=torch.optim.SGD(_collect_trainable_params(model, aux_head), lr=1e-4),  
+        criterion=criterion, device=device,
+        vocab_size=vocab_size, max_seq_len=cfg.MAX_LEN,
+        ambiguous_token_id=ambiguous_token_id, kmer_size=kmer_size,
+        dual_stream=False, collect_selfsup_extras=True, task=task,
+    )
 
-    metrics_vocab = vocab_for_head
-    return model, head, params, False, metrics_vocab
+def _build_replay_loader(
+    tokenizer, stage1_files: List[str], batch_size: int, aux_task: str, fraction: float, pin: bool
+) -> Optional[DataLoader]:
+    if fraction <= 0.0:
+        return None
+    ds = SelfSupDataset(files=stage1_files)
+    ds = _subsample(ds, fraction, cfg.RANDOM_SEED, "first_k")
+    if len(ds) == 0:
+        return None
+    collate = make_selfsup_collate(tokenizer, task=aux_task)
+    return DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=0, pin_memory=pin)
 
-def _load_texts(files: list[str]) -> list[str]:
-    ds = SelfSupDataset(files=files)
-    return [ds[i]["seq"] for i in range(len(ds))]
-
-def _pretty_print_metrics(tag: str, metrics: dict):
-    top5 = metrics.get("task_top5", {})
-    def _r(v):
-        try:
-            return round(float(v), 4)
-        except Exception:
-            return v
-    compact = {k: _r(v) for k, v in top5.items()}
-    print(f"{tag} {compact}")
-
-def _train_with_signature_guard(*args, **kwargs):
-    sig = inspect.signature(train)
-    allowed = set(sig.parameters.keys())
-    filtered = {k: v for k, v in kwargs.items() if k in allowed}
-    if "print_batch_metrics" in allowed:
-        filtered["print_batch_metrics"] = False
-    return train(*args, **filtered)
-
-def _coalesce(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
-
-def _encode_any(
-    model,
-    x,
-    attention_mask=None,
-    motif_flags=None,
-    position_ids=None,
-    *,
-    bpe_input_ids=None,
-    bpe_attention_mask=None,
-    bpe_position_ids=None,
-):
- 
-    enc = getattr(model, "encoder", model)
-
-    if isinstance(x, dict):
-        k_ids = x.get("kmer_input_ids", x.get("input_ids"))
-        b_ids = _coalesce(x.get("bpe_input_ids"), bpe_input_ids)
-        k_am  = x.get("kmer_attention_mask", x.get("attention_mask"))
-        b_am  = _coalesce(x.get("bpe_attention_mask"), bpe_attention_mask)
-        k_pos = x.get("kmer_position_ids", x.get("position_ids"))
-        b_pos = _coalesce(x.get("bpe_position_ids"), bpe_position_ids)
-    else:
-        k_ids, k_am, k_pos = x, attention_mask, position_ids
-        b_ids, b_am, b_pos = bpe_input_ids, bpe_attention_mask, bpe_position_ids
-
-    if isinstance(enc, DualStreamEncoder):
-        if b_ids is None:
-            if k_ids is None:
-                raise ValueError("DualStreamEncoder requires at least k-mer input ids.")
-            b_ids = torch.full_like(k_ids, fill_value=cfg.PAD_TOKEN_ID)
-            b_am = torch.zeros_like(k_ids)
-            b_pos = None
-        return enc(
-            kmer_input_ids=k_ids,
-            bpe_input_ids=b_ids,
-            kmer_attention_mask=k_am,
-            bpe_attention_mask=b_am,
-            kmer_position_ids=k_pos,
-            bpe_position_ids=b_pos,
-            motif_flags=motif_flags,
-        )
-
-    return enc(k_ids, attention_mask=k_am, motif_flags=motif_flags, position_ids=k_pos)
-
-def _make_seqcls_collate(tokenizer, label_key: str = "global_label"):
-    pad_id = tokenizer.pad_id()
-    is_dual = hasattr(tokenizer, "encode_for_embedding")
-    mask_id = tokenizer.vocab.get(cfg.MASK_TOKEN, pad_id)
-
-    def collate(batch):
-        import torch
-        seqs = [b["seq"] for b in batch]
-        labels = torch.tensor([int(b[label_key]) for b in batch], dtype=torch.long)
-
-        if not is_dual:
-            ids = [tokenizer.encode(s) for s in seqs]
-            from tokenizers.utils import batchify
-            out = batchify(ids, pad_id=pad_id, max_len=getattr(cfg, "MAX_LEN", None), return_positions=True)
-            base_ids = out["input_ids"]
-        else:
-            enc = [tokenizer.encode_for_embedding(s) for s in seqs]
-            out = tokenizer.collate_batch_for_embedding(
-                enc, max_len_k=getattr(cfg, "MAX_LEN", None), max_len_b=getattr(cfg, "MAX_LEN", None), return_positions=True
-            )
-            base_ids = out["kmer_input_ids"]
-
-        view1 = cml_augment_random_mask(base_ids, None, mask_token_id=mask_id, pad_token_id=pad_id)
-        view2 = cml_augment_random_mask(base_ids, None, mask_token_id=mask_id, pad_token_id=pad_id)
-
-        out["labels"] = labels
-        out["input_ids_view1"] = view1
-        out["input_ids_view2"] = view2
-        out["attention_mask_view1"] = (view1 != pad_id).long()
-        out["attention_mask_view2"] = (view2 != pad_id).long()
-        return out
-
-    return collate
+def _linear_probe_eval(
+    model, tokenizer, files: List[str], label_key: str, n_splits: int = 3
+) -> Dict[str, Any]:
+    try:
+        ds = SupervisedMotifDataset(txt_files=files, txt_schema="seq_label", map_label_key=label_key)
+        if len(ds) < 8:
+            return {"linear_probe_top1": float("nan"), "linear_probe_macro_f1": float("nan")}
+        device = next(model.parameters()).device
+        encs, ys = [], []
+        loader = DataLoader(ds, batch_size=16, shuffle=False, collate_fn=make_supervised_collate(tokenizer, "map"))
+        with torch.no_grad():
+            for batch in loader:
+                x = (batch.get("input_ids") or batch.get("kmer_input_ids")).to(device)
+                am = (batch.get("attention_mask") or batch.get("kmer_attention_mask"))
+                if am is not None: am = am.to(device)
+                h = getattr(model, "encoder", model)(x, attention_mask=am) 
+                cls = h[:, 0, :].detach().cpu().numpy()
+                encs.append(cls); ys.append(batch["labels"].numpy())
+        X = np.concatenate(encs); y = np.concatenate(ys)
+        skf = StratifiedKFold(n_splits=min(n_splits, len(np.unique(y))))
+        accs, f1s = [], []
+        for tr, te in skf.split(X, y):
+            means = {}
+            for c in np.unique(y[tr]):
+                means[c] = X[tr][y[tr] == c].mean(axis=0)
+            def pred(vec):
+                best, bestc = -1e9, None
+                for c, mu in means.items():
+                    s = np.dot(vec, mu) / (1e-8 + np.linalg.norm(vec) * np.linalg.norm(mu))
+                    if s > best: best, bestc = s, c
+                return bestc
+            yp = np.array([pred(v) for v in X[te]])
+            accs.append((yp == y[te]).mean())
+            from sklearn.metrics import f1_score
+            f1s.append(f1_score(y[te], yp, average="macro", zero_division=0))
+        return {"linear_probe_top1": float(np.mean(accs)), "linear_probe_macro_f1": float(np.mean(f1s))}
+    except Exception:
+        return {"linear_probe_top1": float("nan"), "linear_probe_macro_f1": float("nan")}
 
 def main():
-    _seed_all(cfg.RANDOM_SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    tokenizer = create_tokenizer(cfg)
-
-    ds_all_1 = SelfSupDataset(files=cfg.DATA_FILES)
-    tok_idx = _sample_indices(len(ds_all_1), getattr(cfg, "DATASET_FRACTION", 1.0), cfg.RANDOM_SEED, "first_k")
-    raw_corpus = [ds_all_1[i]["seq"][: cfg.MAX_LEN] for i in tok_idx]
-    print(f"Tokenizer corpus: {len(tok_idx)} seqs (fraction={getattr(cfg, 'DATASET_FRACTION', 1.0)})")
-    tokenizer.train(raw_corpus)
-    print(f"Tokenizer trained. Vocab size: {len(tokenizer.vocab)}")
-
-    tok_type = getattr(cfg, "TOKENIZER_TYPE", "kmer").lower()
-    hybrid_mode = getattr(cfg, "HYBRID_MODE", "dual").lower()
-    if tok_type == "hybrid" and hybrid_mode == "token":
-        fused = _effective_vocab_size_for_token_fusion(tokenizer)
-        km = len(tokenizer.kmer_tokenizer.vocab)
-        bp = len(tokenizer.bpe_tokenizer.vocab)
-        print(f"[hybrid-token] kmer_vocab={km}  bpe_vocab={bp}  fused_vocab={fused}")
-        if fused <= 5:
-            raise RuntimeError(
-                "Hybrid token-fusion fused vocab did not grow (>5). "
-                "Increase DATASET_FRACTION / adjust KMER_SIZE / increase BPE VOCAB_SIZE."
-            )
-
-    selected_task = getattr(cfg, "PRETRAIN_TASK", "mlm").lower()
-    if selected_task in ("mlm", "span", "dae"):
-        assert cfg.MASK_TOKEN in tokenizer.vocab, f"{cfg.MASK_TOKEN} not in tokenizer.vocab; add to special tokens."
-
-    model, head, params, is_dual, metrics_vocab = _build_model_and_head(tokenizer, device)
-    optimizer = torch.optim.AdamW(params, lr=cfg.LEARNING_RATE, weight_decay=1e-2)
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
-
-    train_fraction = getattr(cfg, "TRAINSET_FRACTION", getattr(cfg, "DATASET_FRACTION", 1.0))
-
+    _seed_all(getattr(cfg, "RANDOM_SEED", 42))
+    device = _device()
     pin = torch.cuda.is_available()
 
-    print("\n====== STAGE 1: SELF-SUPERVISED LEARNING ON COMPLETE SEQUENCES OF RNA VIRUSES ======")
-    full_ds = SelfSupDataset(files=cfg.DATA_FILES)
-    if len(full_ds) == 0:
-        print(f"No self-supervised data found in {cfg.DATA_FILES}. Exiting.")
+    _snapshot_config()
+
+    stage1_all = SelfSupDataset(files=cfg.DATA_FILES)
+    if len(stage1_all) == 0:
+        print(f"[FATAL] No Stage-1 data found at {cfg.DATA_FILES}")
         return
 
-    full_ds_sub = _subsample_dataset(full_ds, train_fraction, cfg.RANDOM_SEED, "first_k")
-    if len(full_ds_sub) > 1:
-        indices = list(range(len(full_ds_sub)))
-        tr_idx, va_idx = train_test_split(indices, test_size=0.3, random_state=cfg.RANDOM_SEED)
-        ss_train = torch.utils.data.Subset(full_ds_sub, tr_idx)
-        ss_val = torch.utils.data.Subset(full_ds_sub, va_idx)
+    tok_fraction = float(getattr(cfg, "DATASET_FRACTION", 1.0))
+    stage1_tok = _subsample(stage1_all, tok_fraction, cfg.RANDOM_SEED, "first_k")
+    tok_corpus = [stage1_tok[i]["seq"][: cfg.MAX_LEN] for i in range(len(stage1_tok))]
+
+    tokenizer = create_tokenizer(cfg)
+    tokenizer.train(tok_corpus)
+    vocab_sha = _sha1_texts(tok_corpus)
+    _save_json(TOKENIZER_META_PATH, {
+        "kmer_size": int(getattr(cfg, "KMER_SIZE", 3)),
+        "vocab_size": int(getattr(cfg, "VOCAB_SIZE", 1000)),
+        "merge_num": getattr(cfg, "MERGE_NUM", None),
+        "hybrid_mode": str(getattr(cfg, "HYBRID_MODE", "dual")),
+        "tokenizer_type": str(getattr(cfg, "TOKENIZER_TYPE", "kmer")),
+        "corpus_hash": vocab_sha,
+    })
+    tokenizer = _maybe_lock_tokenizer(tokenizer)
+    print(f"[Tokenizer] Trained & locked. Vocab={len(getattr(tokenizer,'vocab', {}))}")
+
+    model, ss_head, metrics_vocab, is_dual, head_vocab = _build_model_and_head_for_selfsup(tokenizer, device)
+
+    params = _collect_trainable_params(model, ss_head)
+    optimizer = _build_optimizer(params, lr=cfg.LEARNING_RATE, weight_decay=1e-2)
+    scheduler = _build_warmup_cosine_scheduler(optimizer, WARMUP_STEPS, COSINE_TOTAL_STEPS)
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLE)
+    ema = EMAWeights(model, decay=EMA_DECAY) if USE_EMA else None
+
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+    print("\n====== STAGE 1: SELF-SUP (RNA viruses, complete) ======")
+    stage1_frac = float(getattr(cfg, "TRAINSET_FRACTION", tok_fraction))
+    stage1_sub = _subsample(stage1_all, stage1_frac, cfg.RANDOM_SEED, "first_k")
+    s1_idx = list(range(len(stage1_sub)))
+    if len(s1_idx) > 1:
+        tr_idx, va_idx = train_test_split(s1_idx, test_size=0.3, random_state=cfg.RANDOM_SEED)
+        s1_tr, s1_va = Subset(stage1_sub, tr_idx), Subset(stage1_sub, va_idx)
     else:
-        ss_train = full_ds_sub
-        ss_val = full_ds_sub
+        s1_tr = stage1_sub; s1_va = stage1_sub
 
-    collate = make_selfsup_collate(tokenizer, task=selected_task)
-    ss_train_loader = DataLoader(ss_train, batch_size=cfg.BATCH_SIZE, shuffle=True,  collate_fn=collate, num_workers=0, pin_memory=pin)
-    ss_val_loader   = DataLoader(ss_val,   batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate, num_workers=0, pin_memory=pin)
+    collate_s1 = make_selfsup_collate(tokenizer, task=getattr(cfg, "PRETRAIN_TASK", "mlm"))
+    s1_tr_loader = DataLoader(s1_tr, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_s1, num_workers=0, pin_memory=pin)
+    s1_va_loader = DataLoader(s1_va, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_s1, num_workers=0, pin_memory=pin)
 
-    _probe_first_batch(ss_train_loader)
-    for epoch in range(cfg.EPOCHS):
-        trm = _train_with_signature_guard(
-            model, head, ss_train_loader, optimizer, criterion, device,
+    prev_metrics = {}
+    for ep in range(getattr(cfg, "EPOCHS", 1)):
+        m_tr = train(
+            model, ss_head, s1_tr_loader, optimizer, criterion, device,
             vocab_size=metrics_vocab, max_seq_len=cfg.MAX_LEN,
-            ambiguous_token_id=tokenizer.vocab.get("N", None),
-            kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-            collect_selfsup_extras=True, task=selected_task,
+            ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+            dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
         )
-        vam = evaluate(
-            model, head, ss_val_loader, criterion, device,
+        m_va = evaluate(
+            model, ss_head, s1_va_loader, criterion, device,
             vocab_size=metrics_vocab, max_seq_len=cfg.MAX_LEN,
-            ambiguous_token_id=tokenizer.vocab.get("N", None),
-            kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-            collect_selfsup_extras=True, task=selected_task,
+            ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+            dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
         )
-        print(f"[Stage1/{selected_task}] Epoch {epoch + 1}/{cfg.EPOCHS}")
-        _pretty_print_metrics("  Train:", trm)
-        _pretty_print_metrics("  Valid:", vam)
-        torch.nn.utils.clip_grad_norm_([p for p in params if p.requires_grad], max_norm=cfg.GRAD_CLIP)
+        scheduler.step()
+        if ema: ema.update(model)
+        print(f"[Stage1] ep {ep+1}: train={m_tr.get('task_top5',{})}  valid={m_va.get('task_top5',{})}")
+        prev_metrics = m_va
 
-    try:
-        torch.save(model.state_dict(), cfg.CKPT_STAGE1A)
-        print(f"Saved {cfg.CKPT_STAGE1A}")
-    except Exception as e:
-        print("Warning: could not save stage 1 checkpoint:", e)
+    torch.save(model.state_dict(), cfg.CKPT_STAGE1A)
 
-    _save_tokenizer(tokenizer)
+    replay_loader = _build_replay_loader(
+        tokenizer, cfg.DATA_FILES, batch_size=max(1, cfg.BATCH_SIZE // 2),
+        aux_task=AUX_TASK, fraction=REPLAY_FRACTION, pin=pin
+    )
 
-
+    print("\n====== STAGE 2: SELF-SUP (RNA viruses, partial) ======")
     if cfg.PARTIAL_ENABLE:
-        print("\n======= STAGE 2: SELF-SUPERVISED LEARNING ON PARTIAL SEQUENCES OF RNA VIRUSES =======")
         if cfg.PARTIAL_DATA_FILES and len(cfg.PARTIAL_DATA_FILES) > 0:
-            partial_texts = _load_texts(cfg.PARTIAL_DATA_FILES)
-            pv_items = [{"seq": s} for s in partial_texts]
-            print(f"Loaded {len(pv_items)} partial sequences from files: {cfg.PARTIAL_DATA_FILES}")
+            s2 = SelfSupDataset(files=cfg.PARTIAL_DATA_FILES)
         else:
-            full_texts = [full_ds[i]["seq"] for i in range(len(full_ds))]
-            pv_ds = PartialViewDataset(
+            from partial_datasets import PartialViewDataset
+            full_texts = [stage1_all[i]["seq"] for i in range(len(stage1_all))]
+            pv = PartialViewDataset(
                 base_sequences=full_texts,
                 window_size=cfg.PARTIAL_WINDOW_SIZE,
                 windows_per_seq=cfg.PARTIAL_WINDOWS_PER_SEQ,
@@ -396,429 +363,280 @@ def main():
                 strategy=cfg.PARTIAL_STRATEGY,
                 seed=cfg.RANDOM_SEED,
             )
-            pv_items = [pv_ds[i] for i in range(len(pv_ds))]
-            print(f"Cropped {len(pv_items)} partial windows from Stage 1 data.")
+            class _Shim(torch.utils.data.Dataset):
+                def __init__(self, views): self.views=views
+                def __len__(self): return len(self.views)
+                def __getitem__(self, i): return {"seq": self.views[i]}
+            s2 = _Shim([pv[i]["seq"] for i in range(len(pv))])
 
-        if 0 < train_fraction < 1.0:
-            k = max(1, int(len(pv_items) * train_fraction))
-            pv_items = pv_items[:k]
-
-        class _PVShim(torch.utils.data.Dataset):
-            def __init__(self, items): self.items = items
-            def __len__(self): return len(self.items)
-            def __getitem__(self, i): return self.items[i]
-
-        coll = make_selfsup_collate(tokenizer, task=selected_task)
-        pv_loader = DataLoader(_PVShim(pv_items), batch_size=cfg.BATCH_SIZE, shuffle=True,
-                               collate_fn=coll, num_workers=0, pin_memory=pin)
-        for ep in range(cfg.EPOCHS_PARTIAL):
-            trm = _train_with_signature_guard(
-                model, head, pv_loader, optimizer, criterion, device,
+        s2 = _subsample(s2, stage1_frac, cfg.RANDOM_SEED, "first_k")
+        collate_s2 = make_selfsup_collate(tokenizer, task=getattr(cfg, "PRETRAIN_TASK", "mlm"))
+        s2_loader = DataLoader(s2, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_s2, num_workers=0, pin_memory=pin)
+        best = prev_metrics
+        for ep in range(getattr(cfg, "EPOCHS_PARTIAL", 1)):
+            m_tr = train(
+                model, ss_head, s2_loader, optimizer, criterion, device,
                 vocab_size=metrics_vocab, max_seq_len=cfg.PARTIAL_WINDOW_SIZE,
-                ambiguous_token_id=tokenizer.vocab.get("N", None),
-                kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-                collect_selfsup_extras=True, task=selected_task,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
             )
-            _pretty_print_metrics(f"[Stage2/{selected_task}] Epoch {ep+1}/{cfg.EPOCHS_PARTIAL} Train:", trm)
+            scheduler.step()
+            if ema: ema.update(model)
+            print(f"[Stage2] ep {ep+1}: train={m_tr.get('task_top5',{})}")
+            cur = m_tr
+            if _stage_gate_and_log("stage2", best, cur):
+                best = cur
+        torch.save(model.state_dict(), cfg.CKPT_STAGE1B)
 
-        try:
-            torch.save(model.state_dict(), cfg.CKPT_STAGE1B)
-            print(f"Saved {cfg.CKPT_STAGE1B}")
-        except Exception as e:
-            print("Warning: could not save stage 2 checkpoint:", e)
-
-   
-    print("\n====== STAGE 3: SELF-SUPERVISED LEARNING ON COMPLETE RIBOZYME SEQUENCES ======")
-    ss3_full = SelfSupDataset(files=cfg.STAGE2_RIBOZYME_FULL_FILES)
-    if len(ss3_full) > 0:
-        ss3_sub = _subsample_dataset(ss3_full, train_fraction, cfg.RANDOM_SEED, "first_k")
-        if len(ss3_sub) > 1:
-            idx = list(range(len(ss3_sub)))
-            tr_idx, va_idx = train_test_split(idx, test_size=0.3, random_state=cfg.RANDOM_SEED)
-            ds_tr, ds_va = torch.utils.data.Subset(ss3_sub, tr_idx), torch.utils.data.Subset(ss3_sub, va_idx)
+    print("\n====== STAGE 3: SELF-SUP (Ribozymes, full) ======")
+    s3_full = SelfSupDataset(files=cfg.STAGE2_RIBOZYME_FULL_FILES)
+    if len(s3_full) > 0:
+        s3_sub = _subsample(s3_full, stage1_frac, cfg.RANDOM_SEED, "first_k")
+        idx = list(range(len(s3_sub)))
+        if len(idx) > 1:
+            tr, va = train_test_split(idx, test_size=0.3, random_state=cfg.RANDOM_SEED)
+            s3_tr, s3_va = Subset(s3_sub, tr), Subset(s3_sub, va)
         else:
-            ds_tr, ds_va = ss3_sub, ss3_sub
-
-        coll = make_selfsup_collate(tokenizer, task=selected_task)
-        tr_loader = DataLoader(ds_tr, batch_size=cfg.BATCH_SIZE, shuffle=True,  collate_fn=coll, num_workers=0, pin_memory=pin)
-        va_loader = DataLoader(ds_va, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=coll, num_workers=0, pin_memory=pin)
-
-        for ep in range(cfg.EPOCHS_STAGE2):
-            trm = _train_with_signature_guard(
-                model, head, tr_loader, optimizer, criterion, device,
+            s3_tr = s3_sub; s3_va = s3_sub
+        collate_s3 = make_selfsup_collate(tokenizer, task=getattr(cfg, "PRETRAIN_TASK", "mlm"))
+        s3_tr_loader = DataLoader(s3_tr, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_s3, num_workers=0, pin_memory=pin)
+        s3_va_loader = DataLoader(s3_va, batch_size=cfg.BATCH_SIZE, shuffle=False, collate_fn=collate_s3, num_workers=0, pin_memory=pin)
+        best = prev_metrics
+        for ep in range(getattr(cfg, "EPOCHS_STAGE2", 3)):
+            m_tr = train(
+                model, ss_head, s3_tr_loader, optimizer, criterion, device,
                 vocab_size=metrics_vocab, max_seq_len=cfg.MAX_LEN,
-                ambiguous_token_id=tokenizer.vocab.get("N", None),
-                kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-                collect_selfsup_extras=True, task=selected_task,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
             )
-            vam = evaluate(
-                model, head, va_loader, criterion, device,
+            m_va = evaluate(
+                model, ss_head, s3_va_loader, criterion, device,
                 vocab_size=metrics_vocab, max_seq_len=cfg.MAX_LEN,
-                ambiguous_token_id=tokenizer.vocab.get("N", None),
-                kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-                collect_selfsup_extras=True, task=selected_task,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
             )
-            _pretty_print_metrics(f"[Stage3/{selected_task}] Epoch {ep+1}/{cfg.EPOCHS_STAGE2} Train:", trm)
-            _pretty_print_metrics("  Valid:", vam)
-
-        try:
-            torch.save(model.state_dict(), cfg.CKPT_STAGE2)
-            print(f"Saved {cfg.CKPT_STAGE2}")
-        except Exception as e:
-            print("Warning: could not save stage3 checkpoint:", e)
+            scheduler.step()
+            if ema: ema.update(model)
+            print(f"[Stage3] ep {ep+1}: train={m_tr.get('task_top5',{})} valid={m_va.get('task_top5',{})}")
+            if _stage_gate_and_log("stage3", m_tr, m_va):
+                best = m_va
+        torch.save(model.state_dict(), cfg.CKPT_STAGE2)
     else:
-        print("Stage 3 dataset empty  skipped.")
+        print("[Stage3] No ribozyme full data. Skipping.")
 
-    
-    print("\n====== STAGE 4: SELF-SUPERVISED LEARNING ON PARTIAL RIBOZYME SEQUENCES ======")
+    print("\n====== STAGE 4: SELF-SUP (Ribozymes, partial) ======")
     if cfg.STAGE3_RIBOZYME_PARTIAL_FILES:
-        ss4 = SelfSupDataset(files=cfg.STAGE3_RIBOZYME_PARTIAL_FILES)
-        ss4_sub = _subsample_dataset(ss4, train_fraction, cfg.RANDOM_SEED, "first_k")
-        pv_items = [{"seq": ss4_sub[i]["seq"]} for i in range(len(ss4_sub))]
+        s4 = SelfSupDataset(files=cfg.STAGE3_RIBOZYME_PARTIAL_FILES)
+        s4 = _subsample(s4, stage1_frac, cfg.RANDOM_SEED, "first_k")
     else:
-        full_texts = _load_texts(cfg.STAGE2_RIBOZYME_FULL_FILES)
-        pv_ds = PartialViewDataset(
-            base_sequences=full_texts,
-            window_size=cfg.PARTIAL_WINDOW_SIZE,
-            windows_per_seq=cfg.PARTIAL_WINDOWS_PER_SEQ,
-            overlap=cfg.PARTIAL_OVERLAP,
-            strategy=cfg.PARTIAL_STRATEGY,
-            seed=cfg.RANDOM_SEED,
-        )
-        pv_items = [pv_ds[i] for i in range(len(pv_ds))]
+        full_texts = [SelfSupDataset(files=cfg.STAGE2_RIBOZYME_FULL_FILES)[i]["seq"]
+                      for i in range(len(SelfSupDataset(files=cfg.STAGE2_RIBOZYME_FULL_FILES)))]
+        if len(full_texts) == 0:
+            s4 = SelfSupDataset(files=[])  # empty
+        else:
+            from partial_datasets import PartialViewDataset
+            pv = PartialViewDataset(
+                base_sequences=full_texts,
+                window_size=cfg.PARTIAL_WINDOW_SIZE,
+                windows_per_seq=cfg.PARTIAL_WINDOWS_PER_SEQ,
+                overlap=cfg.PARTIAL_OVERLAP,
+                strategy=cfg.PARTIAL_STRATEGY,
+                seed=cfg.RANDOM_SEED,
+            )
+            class _Shim2(torch.utils.data.Dataset):
+                def __init__(self, views): self.views=views
+                def __len__(self): return len(self.views)
+                def __getitem__(self, i): return {"seq": self.views[i]}
+            s4 = _Shim2([pv[i]["seq"] for i in range(len(pv))])
 
-    if 0 < train_fraction < 1.0:
-        k = max(1, int(len(pv_items) * train_fraction))
-        pv_items = pv_items[:k]
-
-    class _PVShim2(torch.utils.data.Dataset):
-        def __init__(self, items): self.items = items
-        def __len__(self): return len(self.items)
-        def __getitem__(self, i): return self.items[i]
-
-    coll = make_selfsup_collate(tokenizer, task=selected_task)
-    pv_loader = DataLoader(_PVShim2(pv_items), batch_size=cfg.BATCH_SIZE, shuffle=True,
-                           collate_fn=coll, num_workers=0, pin_memory=pin)
-    for ep in range(cfg.EPOCHS_STAGE3):
-        trm = _train_with_signature_guard(
-            model, head, pv_loader, optimizer, criterion, device,
-            vocab_size=metrics_vocab, max_seq_len=cfg.PARTIAL_WINDOW_SIZE,
-            ambiguous_token_id=tokenizer.vocab.get("N", None),
-            kmer_size=cfg.KMER_SIZE, dual_stream=is_dual,
-            collect_selfsup_extras=True, task=selected_task,
-        )
-        _pretty_print_metrics(f"[Stage4/{selected_task}] Epoch {ep+1}/{cfg.EPOCHS_STAGE3} Train:", trm)
-
-    try:
+    if len(s4) > 0:
+        collate_s4 = make_selfsup_collate(tokenizer, task=getattr(cfg, "PRETRAIN_TASK", "mlm"))
+        s4_loader = DataLoader(s4, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=collate_s4, num_workers=0, pin_memory=pin)
+        best = prev_metrics
+        for ep in range(getattr(cfg, "EPOCHS_STAGE3", 3)):
+            m_tr = train(
+                model, ss_head, s4_loader, optimizer, criterion, device,
+                vocab_size=metrics_vocab, max_seq_len=cfg.PARTIAL_WINDOW_SIZE,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=is_dual, collect_selfsup_extras=True, task=getattr(cfg, "PRETRAIN_TASK", "mlm"),
+            )
+            scheduler.step()
+            if ema: ema.update(model)
+            print(f"[Stage4] ep {ep+1}: train={m_tr.get('task_top5',{})}")
+            if _stage_gate_and_log("stage4", best, m_tr):
+                best = m_tr
         torch.save(model.state_dict(), cfg.CKPT_STAGE3)
-        print(f"Saved {cfg.CKPT_STAGE3}")
-    except Exception as e:
-        print("Warning: could not save stage 4 checkpoint:", e)
+    else:
+        print("[Stage4] No ribozyme partial data. Skipping.")
+
+    print("\n====== INDUCTIVE TRANSFER BEGINS (Stages 5–7) ======")
+    _freeze_encoder_layers(model, unfreeze_top_n=UNFREEZE_TOP_N)
 
     if cfg.STAGE4_WEAK_SEQCLS and len(cfg.STAGE4_WEAK_SEQCLS) > 0:
-        print("\n====== STAGE 5:SUPERVISED LEARNING ON LABELED PARTIAL RNA VIRUS SEQUENCES  =====")
-        ds5 = SupervisedMotifDataset(txt_files=cfg.STAGE4_WEAK_SEQCLS, txt_schema="seq_label")
-        ds5 = _subsample_dataset(ds5, train_fraction, cfg.RANDOM_SEED, "first_k")
-        coll5 = _make_seqcls_collate(tokenizer, label_key=cfg.MAP_LABEL_KEY)
-        loader5 = DataLoader(ds5, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll5,
-                             num_workers=0, pin_memory=pin)
+        print("\n====== STAGE 5: SUP (RNA viruses, partial, seq-level) ======")
+        ds5 = SupervisedMotifDataset(txt_files=cfg.STAGE4_WEAK_SEQCLS, txt_schema="seq_label", map_label_key=cfg.MAP_LABEL_KEY)
+        ds5 = _subsample(ds5, stage1_frac, cfg.RANDOM_SEED, "first_k")
+        coll5 = lambda b: make_supervised_collate(tokenizer, task_name="map", augment="mask_non_motif")(b)
+        loader5 = DataLoader(ds5, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll5, num_workers=0, pin_memory=pin)
 
-        head5 = MotifAnnotatedPretrainingHead(embedding_dim=cfg.EMBED_DIM, output_dim=cfg.MAP_NUM_CLASSES_COARSE).to(device)
+        head5 = MotifAnnotatedPretrainingHead(cfg.EMBED_DIM, output_dim=cfg.MAP_NUM_CLASSES_COARSE).to(device)
         proj5 = getattr(model, "cml_head", ContrastiveMotifLearningHead().to(device))
 
-        opt5 = torch.optim.AdamW(
-            _dedupe_params(list(model.parameters()) + list(head5.parameters()) + list(proj5.parameters())),
-            lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE4, weight_decay=1e-2
-        )
+        cw = compute_class_weights(ds5, label_key=cfg.MAP_LABEL_KEY)
+        ce_weight_vec = torch.tensor(cw, dtype=torch.float32, device=device) if cw is not None else None
 
-        for ep in range(cfg.EPOCHS_STAGE4):
-            model.train(); head5.train(); proj5.train()
-            for batch in loader5:
-                xk = _coalesce(batch.get("kmer_input_ids"), batch.get("input_ids")).to(device)
-                xb = batch.get("bpe_input_ids")
-                xb = xb.to(device) if xb is not None else None
-                amk = _coalesce(batch.get("kmer_attention_mask"), batch.get("attention_mask"))
-                amb = batch.get("bpe_attention_mask", None)
-                if amk is not None: amk = amk.to(device)
-                if amb is not None: amb = amb.to(device)
-                y = batch["labels"].to(device)
+        optimizer5 = _build_optimizer(_collect_trainable_params(model, head5, proj5), lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE4, weight_decay=1e-2)
+        scheduler5 = _build_warmup_cosine_scheduler(optimizer5, WARMUP_STEPS, COSINE_TOTAL_STEPS)
 
-                enc = _encode_any(
-                    model, xk, attention_mask=amk,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
+        aux_head5 = _build_aux_head(model, AUX_TASK, metrics_vocab)
+        aux_loader5 = _build_replay_loader(tokenizer, cfg.DATA_FILES, batch_size=max(1, cfg.BATCH_SIZE // 2), aux_task=AUX_TASK, fraction=REPLAY_FRACTION, pin=pin)
+
+        best_score = -1e9
+        patience = EARLY_STOP_PATIENCE
+        for ep in range(getattr(cfg, "EPOCHS_STAGE4", 2)):
+            mt = train_cls_ce_supcon_epoch(
+                model, head5, proj5, loader5, optimizer5, device,
+                ce_weight=float(getattr(cfg, "CE_WEIGHT", 1.0)),
+                supcon_weight=float(getattr(cfg, "SUPCON_WEIGHT", 0.5)),
+                temperature=float(getattr(cfg, "SUPCON_TEMPERATURE", 0.07)),
+            )
+            if aux_loader5 is not None and AUX_WEIGHT > 0:
+                aux_metrics = _aux_step_selfsup(
+                    model, aux_head5, aux_loader5, torch.nn.CrossEntropyLoss(ignore_index=-100), device,
+                    vocab_size=metrics_vocab, kmer_size=cfg.KMER_SIZE,
+                    ambiguous_token_id=tokenizer.vocab.get("N", None), task=AUX_TASK
                 )
-                logits = head5(enc)
-                loss_ce = torch.nn.functional.cross_entropy(logits, y)
+                scheduler5.step()
+                print(f"[Stage5][AUX {AUX_TASK}] top5={aux_metrics.get('task_top5',{})}")
+            else:
+                scheduler5.step()
 
-                v1 = batch["input_ids_view1"].to(device)
-                v2 = batch["input_ids_view2"].to(device)
-                am1 = batch["attention_mask_view1"].to(device)
-                am2 = batch["attention_mask_view2"].to(device)
+            if ema: ema.update(model)
+            mv = eval_cls_ce_supcon_epoch(model, head5, proj5, loader5, device)
+            print(f"[Stage5] ep {ep+1}: train={mt.get('task_top5',{})} valid={mv.get('task_top5',{})}")
 
-                z1 = proj5(_encode_any(
-                    model, v1, attention_mask=am1,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
-                ))
-                z2 = proj5(_encode_any(
-                    model, v2, attention_mask=am2,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
-                ))
-
-                z = torch.cat([z1, z2], dim=0)
-                y2 = torch.cat([y, y], dim=0)
-                loss_supcon = supervised_contrastive_loss(z, y2, temperature=cfg.SUPCON_TEMPERATURE)
-
-                loss = cfg.CE_WEIGHT * loss_ce + cfg.SUPCON_WEIGHT * loss_supcon
-
-                opt5.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt5.step()
-
-            print(f"[Stage5] epoch {ep+1}: CE={loss_ce.item():.4f}  SupCon={loss_supcon.item():.4f}  Total={loss.item():.4f}")
-
-        try:
-            torch.save(model.state_dict(), cfg.CKPT_STAGE4)
-            print(f"Saved {cfg.CKPT_STAGE4}")
-        except Exception as e:
-            print("Warning: could not save stage 5 checkpoint:", e)
+            score = float(mt.get("macro_f1_cls", float("nan")))
+            if not math.isnan(score) and score > best_score:
+                best_score = score
+                patience = EARLY_STOP_PATIENCE
+                torch.save(model.state_dict(), cfg.CKPT_STAGE4)
+            else:
+                patience -= 1
+                if patience <= 0:
+                    print("[Stage5] Early stopping triggered.")
+                    break
 
     if cfg.STAGE5_WEAK_RIBOZYME_SEQCLS and len(cfg.STAGE5_WEAK_RIBOZYME_SEQCLS) > 0:
-        print("\n====== STAGE 6: SUPERVISED LEARNING ON LABELED PARTIAL RIBOZYME SEQUENCES ======")
-        ds6w = SupervisedMotifDataset(txt_files=cfg.STAGE5_WEAK_RIBOZYME_SEQCLS, txt_schema="seq_label")
-        ds6w = _subsample_dataset(ds6w, train_fraction, cfg.RANDOM_SEED, "first_k")
-        coll6w = _make_seqcls_collate(tokenizer, label_key=cfg.MAP_LABEL_KEY)
-        loader6w = DataLoader(ds6w, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll6w,
-                              num_workers=0, pin_memory=pin)
+        print("\n====== STAGE 6: SUP (Ribozymes, partial, seq-level) ======")
+        ds6 = SupervisedMotifDataset(txt_files=cfg.STAGE5_WEAK_RIBOZYME_SEQCLS, txt_schema="seq_label", map_label_key=cfg.MAP_LABEL_KEY)
+        ds6 = _subsample(ds6, stage1_frac, cfg.RANDOM_SEED, "first_k")
+        coll6 = lambda b: make_supervised_collate(tokenizer, task_name="map", augment="mask_non_motif")(b)
+        loader6 = DataLoader(ds6, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll6, num_workers=0, pin_memory=pin)
 
-        head6w = MotifAnnotatedPretrainingHead(embedding_dim=cfg.EMBED_DIM, output_dim=cfg.MAP_NUM_CLASSES_RIBOZYME).to(device)
-        proj6w = getattr(model, "cml_head", ContrastiveMotifLearningHead().to(device))
+        head6 = MotifAnnotatedPretrainingHead(cfg.EMBED_DIM, output_dim=cfg.MAP_NUM_CLASSES_RIBOZYME).to(device)
+        proj6 = getattr(model, "cml_head", ContrastiveMotifLearningHead().to(device))
+        optimizer6 = _build_optimizer(_collect_trainable_params(model, head6, proj6), lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE5, weight_decay=1e-2)
+        scheduler6 = _build_warmup_cosine_scheduler(optimizer6, WARMUP_STEPS, COSINE_TOTAL_STEPS)
 
-        opt6w = torch.optim.AdamW(
-            _dedupe_params(list(model.parameters()) + list(head6w.parameters()) + list(proj6w.parameters())),
-            lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE5, weight_decay=1e-2
-        )
+        aux_head6 = _build_aux_head(model, AUX_TASK, metrics_vocab)
+        aux_loader6 = _build_replay_loader(tokenizer, cfg.DATA_FILES, batch_size=max(1, cfg.BATCH_SIZE // 2), aux_task=AUX_TASK, fraction=REPLAY_FRACTION, pin=pin)
 
-        for ep in range(cfg.EPOCHS_STAGE5):
-            model.train(); head6w.train(); proj6w.train()
-            for batch in loader6w:
-                xk = _coalesce(batch.get("kmer_input_ids"), batch.get("input_ids")).to(device)
-                xb = batch.get("bpe_input_ids")
-                xb = xb.to(device) if xb is not None else None
-                amk = _coalesce(batch.get("kmer_attention_mask"), batch.get("attention_mask"))
-                amb = batch.get("bpe_attention_mask", None)
-                if amk is not None: amk = amk.to(device)
-                if amb is not None: amb = amb.to(device)
-                y = batch["labels"].to(device)
-
-                enc = _encode_any(
-                    model, xk, attention_mask=amk,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
+        best_score = -1e9
+        patience = EARLY_STOP_PATIENCE
+        for ep in range(getattr(cfg, "EPOCHS_STAGE5", 3)):
+            mt = train_cls_ce_supcon_epoch(
+                model, head6, proj6, loader6, optimizer6, device,
+                ce_weight=float(getattr(cfg, "CE_WEIGHT", 1.0)),
+                supcon_weight=float(getattr(cfg, "SUPCON_WEIGHT", 0.5)),
+                temperature=float(getattr(cfg, "SUPCON_TEMPERATURE", 0.07)),
+            )
+            if aux_loader6 is not None and AUX_WEIGHT > 0:
+                aux_metrics = _aux_step_selfsup(
+                    model, aux_head6, aux_loader6, torch.nn.CrossEntropyLoss(ignore_index=-100), device,
+                    vocab_size=metrics_vocab, kmer_size=cfg.KMER_SIZE,
+                    ambiguous_token_id=tokenizer.vocab.get("N", None), task=AUX_TASK
                 )
-                logits = head6w(enc)
-                loss_ce = torch.nn.functional.cross_entropy(logits, y)
+                scheduler6.step()
+                print(f"[Stage6][AUX {AUX_TASK}] top5={aux_metrics.get('task_top5',{})}")
+            else:
+                scheduler6.step()
 
-                v1 = batch["input_ids_view1"].to(device)
-                v2 = batch["input_ids_view2"].to(device)
-                am1 = batch["attention_mask_view1"].to(device)
-                am2 = batch["attention_mask_view2"].to(device)
+            if ema: ema.update(model)
+            mv = eval_cls_ce_supcon_epoch(model, head6, proj6, loader6, device)
+            print(f"[Stage6] ep {ep+1}: train={mt.get('task_top5',{})} valid={mv.get('task_top5',{})}")
 
-                z1 = proj6w(_encode_any(
-                    model, v1, attention_mask=am1,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
-                ))
-                z2 = proj6w(_encode_any(
-                    model, v2, attention_mask=am2,
-                    bpe_input_ids=xb, bpe_attention_mask=amb,
-                ))
-
-                z = torch.cat([z1, z2], dim=0)
-                y2 = torch.cat([y, y], dim=0)
-                loss_supcon = supervised_contrastive_loss(z, y2, temperature=cfg.SUPCON_TEMPERATURE)
-
-                loss = cfg.CE_WEIGHT * loss_ce + cfg.SUPCON_WEIGHT * loss_supcon
-
-                opt6w.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt6w.step()
-
-            print(f"[Stage6] epoch {ep+1}: CE={loss_ce.item():.4f}  SupCon={loss_supcon.item():.4f}  Total={loss.item():.4f}")
-
-        try:
-            torch.save(model.state_dict(), cfg.CKPT_STAGE5)
-            print(f"Saved {cfg.CKPT_STAGE5}")
-        except Exception as e:
-            print("Warning: could not save stage 6 checkpoint:", e)
-
+            score = float(mt.get("macro_f1_cls", float("nan")))
+            if not math.isnan(score) and score > best_score:
+                best_score = score
+                patience = EARLY_STOP_PATIENCE
+                torch.save(model.state_dict(), cfg.CKPT_STAGE5)
+            else:
+                patience -= 1
+                if patience <= 0:
+                    print("[Stage6] Early stopping triggered.")
+                    break
 
     if cfg.STAGE6_GOLD_MIXED and len(cfg.STAGE6_GOLD_MIXED) > 0:
-        print("\n====== STAGE 7: MOTIF-AWARE SUPERVISED LEARNING ON RNA VIRUSES AND RIBOZYME SEQUENCES ======")
+        print("\n====== STAGE 7: SUP (Token-level motifs on mixed RNA/Ribozymes) ======")
         ds7 = SupervisedMotifDataset(jsonl_files=cfg.STAGE6_GOLD_MIXED)
-        ds7 = _subsample_dataset(ds7, train_fraction, cfg.RANDOM_SEED, "first_k")
+        ds7 = _subsample(ds7, stage1_frac, cfg.RANDOM_SEED, "first_k")
 
-        for task in cfg.STAGE6_TASKS:
-            print(f"[7] task = {task}")
-            if task in ("masked_motif", "mbp"):
-                coll7 = make_supervised_collate(tokenizer, task_name=task, augment="mask_non_motif")
-                loader7 = DataLoader(ds7, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll7,
-                                     num_workers=0, pin_memory=pin)
-                if task == "masked_motif":
-                    sup_head = model.masked_motif_head if hasattr(model, "masked_motif_head") \
-                               else MaskedMotifModelingHead(cfg.EMBED_DIM, cfg.MOTIF_VOCAB_SIZE).to(device)
-                    sup_crit = torch.nn.CrossEntropyLoss(ignore_index=-100)
-                    vsz = cfg.MOTIF_VOCAB_SIZE
-                else: 
-                    from model import MotifBoundaryPredictionHead
-                    sup_head = model.mbp_head if hasattr(model, "mbp_head") \
-                               else MotifBoundaryPredictionHead(cfg.EMBED_DIM).to(device)
-                    sup_crit = torch.nn.CrossEntropyLoss()
-                    vsz = 2
+    
+        coll7_mm = make_supervised_collate(tokenizer, task_name="masked_motif", augment="mask_non_motif")
+        loader7_mm = DataLoader(ds7, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll7_mm, num_workers=0, pin_memory=pin)
+        head_mm = getattr(model, "masked_motif_head", MaskedMotifModelingHead(cfg.EMBED_DIM, cfg.MOTIF_VOCAB_SIZE).to(device))
+        opt_mm = _build_optimizer(_collect_trainable_params(model, head_mm), lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE6, weight_decay=1e-2)
+        sch_mm = _build_warmup_cosine_scheduler(opt_mm, WARMUP_STEPS, COSINE_TOTAL_STEPS)
 
-                sup_opt = torch.optim.AdamW(
-                    _dedupe_params(list(model.parameters()) + list(sup_head.parameters())),
-                    lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE6, weight_decay=1e-2,
+        from model import MotifBoundaryPredictionHead
+        coll7_mbp = make_supervised_collate(tokenizer, task_name="mbp", augment="mask_non_motif")
+        loader7_mbp = DataLoader(ds7, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll7_mbp, num_workers=0, pin_memory=pin)
+        head_mbp = getattr(model, "mbp_head", MotifBoundaryPredictionHead(cfg.EMBED_DIM).to(device))
+        opt_mbp = _build_optimizer(_collect_trainable_params(model, head_mbp), lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE6, weight_decay=1e-2)
+        sch_mbp = _build_warmup_cosine_scheduler(opt_mbp, WARMUP_STEPS, COSINE_TOTAL_STEPS)
+
+        aux_head7 = _build_aux_head(model, AUX_TASK, metrics_vocab)
+        aux_loader7 = _build_replay_loader(tokenizer, cfg.DATA_FILES, batch_size=max(1, cfg.BATCH_SIZE // 2), aux_task=AUX_TASK, fraction=REPLAY_FRACTION, pin=pin)
+
+        for ep in range(getattr(cfg, "EPOCHS_STAGE6", 3)):
+            mt_mm = train(
+                model, head_mm, loader7_mm, opt_mm, torch.nn.CrossEntropyLoss(ignore_index=-100), device,
+                vocab_size=cfg.MOTIF_VOCAB_SIZE, max_seq_len=cfg.MAX_LEN,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=False, collect_selfsup_extras=True, task="masked_motif",
+            )
+            sch_mm.step()
+            print(f"[Stage7/MM] ep {ep+1}: {mt_mm.get('task_top5',{})}")
+
+            mt_mbp = train(
+                model, head_mbp, loader7_mbp, opt_mbp, torch.nn.CrossEntropyLoss(), device,
+                vocab_size=2, max_seq_len=cfg.MAX_LEN,
+                ambiguous_token_id=tokenizer.vocab.get("N", None), kmer_size=cfg.KMER_SIZE,
+                dual_stream=False, collect_selfsup_extras=True, task="mbp",
+            )
+            sch_mbp.step()
+            print(f"[Stage7/MBP] ep {ep+1}: {mt_mbp.get('task_top5',{})}")
+
+            if aux_loader7 is not None and AUX_WEIGHT > 0:
+                aux_metrics = _aux_step_selfsup(
+                    model, aux_head7, aux_loader7, torch.nn.CrossEntropyLoss(ignore_index=-100), device,
+                    vocab_size=metrics_vocab, kmer_size=cfg.KMER_SIZE,
+                    ambiguous_token_id=tokenizer.vocab.get("N", None), task=AUX_TASK
                 )
-                for ep in range(cfg.EPOCHS_STAGE6):
-                    tr_metrics = train(
-                        model, sup_head, loader7, sup_opt, sup_crit, device,
-                        vocab_size=vsz, max_seq_len=cfg.MAX_LEN,
-                        ambiguous_token_id=tokenizer.vocab.get("N", None),
-                        kmer_size=cfg.KMER_SIZE, dual_stream=False,
-                        collect_selfsup_extras=True, task=task,
-                    )
-                    _pretty_print_metrics(f"[Stage7/{task}] epoch {ep+1}:", tr_metrics)
+                print(f"[Stage7][AUX {AUX_TASK}] top5={aux_metrics.get('task_top5',{})}")
 
-            elif task == "map":
-                coll7 = make_supervised_collate(tokenizer, task_name="map", augment="mask_non_motif")
-                loader7 = DataLoader(ds7, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll7,
-                                     num_workers=0, pin_memory=pin)
+            if ema: ema.update(model)
 
-                sup_head = None
-                sup_crit = None
-                vsz = None
-                sup_opt = None
+        torch.save(model.state_dict(), cfg.CKPT_STAGE6)
 
-                for ep in range(cfg.EPOCHS_STAGE6):
-                    model.train()
-                    epoch_metrics = None
-
-                    for batch in loader7:
-                        labels = batch["labels"]
-                        is_token_level = (labels.dim() == 2)
-
-                        if sup_head is None:
-                            if is_token_level:
-                                vsz = int(getattr(cfg, "MOTIF_VOCAB_SIZE", 2))
-                                sup_head = (getattr(model, "masked_motif_head", None)
-                                            or MaskedMotifModelingHead(cfg.EMBED_DIM, vsz).to(device))
-                                sup_crit = torch.nn.CrossEntropyLoss(ignore_index=-100)
-                                print("[Stage7/map] Detected token-level labels -> using token-level MAP head.")
-                            else:
-                                vsz = int(getattr(cfg, "MAP_NUM_CLASSES_COARSE", 2))
-                                sup_head = (getattr(model, "map_head", None)
-                                            or MotifAnnotatedPretrainingHead(cfg.EMBED_DIM, output_dim=vsz).to(device))
-                                sup_crit = torch.nn.CrossEntropyLoss()
-                                print("[Stage7/map] Detected sequence-level labels -> using sequence-level MAP head.")
-
-                            sup_opt = torch.optim.AdamW(
-                                _dedupe_params(list(model.parameters()) + list(sup_head.parameters())),
-                                lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE6, weight_decay=1e-2,
-                            )
-
-                        metrics = train(
-                            model, sup_head, [(batch)], sup_opt, sup_crit, device,
-                            vocab_size=vsz, max_seq_len=cfg.MAX_LEN,
-                            ambiguous_token_id=tokenizer.vocab.get("N", None),
-                            kmer_size=cfg.KMER_SIZE, dual_stream=False,
-                            collect_selfsup_extras=True, task=("masked_motif" if is_token_level else "map"),
-                        )
-                        epoch_metrics = metrics
-
-                    if epoch_metrics is not None:
-                        _pretty_print_metrics(f"[Stage7/map] epoch {ep+1}:", epoch_metrics)
-
-            elif task == "cml":
-                coll_cml = make_supervised_collate(tokenizer, task_name="masked_motif", augment="mask_non_motif")
-                loader_cml = DataLoader(ds7, batch_size=cfg.BATCH_SIZE, shuffle=True, collate_fn=coll_cml,
-                                        num_workers=0, pin_memory=pin)
-                cml_head = getattr(model, "cml_head", ContrastiveMotifLearningHead().to(device))
-                cml_opt = torch.optim.AdamW(
-                    _dedupe_params(list(model.parameters()) + list(cml_head.parameters())),
-                    lr=cfg.LEARNING_RATE * cfg.LR_MULT_STAGE6, weight_decay=1e-2,
-                )
-                for ep in range(cfg.EPOCHS_STAGE6):
-                    model.train(); cml_head.train()
-                    epoch_loss = 0.0
-                    epoch_nce = 0.0
-                    tp = tn = fp = fn = 0
-                    n_batches = 0
-
-                    for batch in loader_cml:
-                        x1 = _coalesce(batch.get("input_ids"), batch.get("kmer_input_ids")).to(device)
-                        x2 = batch.get("input_ids_view2")
-                        x2 = x2.to(device) if x2 is not None else x1.clone()
-
-                        am1 = _coalesce(batch.get("attention_mask"), batch.get("kmer_attention_mask"))
-                        am2 = batch.get("attention_mask_view2")
-                        if am1 is not None: am1 = am1.to(device)
-                        if am2 is not None: am2 = am2.to(device)
-
-                        z1 = cml_head(_encode_any(model, x1, attention_mask=am1))
-                        z2 = cml_head(_encode_any(model, x2, attention_mask=am2))
-
-                        z1 = torch.nn.functional.normalize(z1, dim=-1)
-                        z2 = torch.nn.functional.normalize(z2, dim=-1)
-                        z = torch.cat([z1, z2], dim=0)
-                        y = torch.arange(z1.size(0), device=z.device).repeat(2)
-
-                        sim = torch.matmul(z, z.t()) / cfg.SUPCON_TEMPERATURE
-                        N = z.size(0)
-                        self_mask = torch.eye(N, dtype=torch.bool, device=z.device)
-                        sim = sim.masked_fill(self_mask, -1e9)
-                        pos_mask = (y.unsqueeze(0) == y.unsqueeze(1)) & (~self_mask)
-                        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
-                        loss = -(log_prob[pos_mask]).mean()
-
-                        nce_loss = loss
-
-                        with torch.no_grad():
-                            preds = sim.argmax(dim=1)
-                            B = z1.size(0)
-                            truth = torch.cat([torch.arange(B, 2*B, device=z.device), torch.arange(0, B, device=z.device)])
-                            correct = (preds == truth)
-                            tp += int(correct.sum().item())
-                            fp += int((preds != truth).sum().item())
-
-                        cml_opt.zero_grad(set_to_none=True); loss.backward()
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        cml_opt.step()
-
-                        epoch_loss += float(loss.item())
-                        epoch_nce  += float(nce_loss.item())
-                        n_batches  += 1
-
-                    contrastive_accuracy  = tp / max(tp + fp + tn + fn, 1)
-                    contrastive_precision = tp / max(tp + fp, 1)
-                    contrastive_recall    = tp / max(tp + fn, 1)
-
-                    print(
-                        f"[Stage7/cml] epoch {ep+1}: "
-                        f"loss={(epoch_loss/max(n_batches,1)):.4f}  "
-                        f"nce_loss={(epoch_nce/max(n_batches,1)):.4f}  "
-                        f"contrastive_accuracy={contrastive_accuracy:.4f}  "
-                        f"contrastive_precision={contrastive_precision:.4f}  "
-                        f"contrastive_recall={contrastive_recall:.4f}"
-                    )
-
-        try:
-            torch.save(model.state_dict(), cfg.CKPT_STAGE6)
-            print(f"Saved {cfg.CKPT_STAGE6}")
-        except Exception as e:
-            print("Warning: could not save stage 7 checkpoint:", e)
+    probe = _linear_probe_eval(
+        model, tokenizer,
+        files=(cfg.STAGE4_WEAK_SEQCLS if (cfg.STAGE4_WEAK_SEQCLS and len(cfg.STAGE4_WEAK_SEQCLS)>0) else cfg.STAGE5_WEAK_RIBOZYME_SEQCLS),
+        label_key=getattr(cfg, "MAP_LABEL_KEY", "global_label")
+    )
+    print(f"\n[Extrinsic probe] {probe}")
 
     print("\nAll stages complete.")
-
 
 if __name__ == "__main__":
     main()
