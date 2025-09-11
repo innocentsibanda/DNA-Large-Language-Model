@@ -1,4 +1,4 @@
-# kmer tokenizer 
+# kmer_tokenizer
 
 from __future__ import annotations
 
@@ -15,13 +15,19 @@ class KmerTokenizer(BaseTokenizer):
         k: int = 3,
         special_tokens: Optional[List[str]] = None,
         max_vocab_size: Optional[int] = None,
+        allow_ambiguous: bool = True,
+        alphabet: str = "ACGTN",
+        enforce_alphabet: bool = False,
     ):
         super().__init__(special_tokens)
         self.k = int(k)
         self.max_vocab_size = int(max_vocab_size) if max_vocab_size is not None else None
+        self.allow_ambiguous = bool(allow_ambiguous)
+        self.alphabet = "".join(sorted(set(alphabet.upper())))
+        self.enforce_alphabet = bool(enforce_alphabet)
+
 
     def train(self, sequences: List[str]) -> None:
-        
         if self.k <= 0:
             raise ValueError("k must be a positive integer")
 
@@ -31,6 +37,7 @@ class KmerTokenizer(BaseTokenizer):
             if len(seq) < self.k:
                 continue
             kmers = (seq[i : i + self.k] for i in range(len(seq) - self.k + 1))
+            kmers = (k for k in kmers if self._valid_kmer(k))
             kmer_counts.update(kmers)
 
         sorted_kmers = (k for k, _ in kmer_counts.most_common())
@@ -51,20 +58,19 @@ class KmerTokenizer(BaseTokenizer):
                 remaining -= 1
 
     def encode(self, sequence: str) -> List[int]:
-      
         sequence = self.preprocess(sequence)
         if len(sequence) < self.k:
             return []
 
-        tokens = [sequence[i : i + self.k] for i in range(len(sequence) - self.k + 1)]
-        unk_id = self.unk_id()
-        return [self.vocab.get(tok, unk_id) for tok in tokens]
+        toks = [sequence[i : i + self.k] for i in range(len(sequence) - self.k + 1)]
+        toks = [t for t in toks if self._valid_kmer(t)]
+        unk = self.unk_id()
+        return [self.vocab.get(t, unk) for t in toks]
 
     def decode(self, token_ids: List[int]) -> str:
-      
         return self.decode_to_sequence(token_ids)
 
-    
+
     def decode_to_kmers(self, token_ids: List[int]) -> List[str]:
         return [self.inv_vocab.get(idx, "<UNK>") for idx in token_ids]
 
@@ -73,35 +79,68 @@ class KmerTokenizer(BaseTokenizer):
         toks = self.decode_to_kmers(token_ids)
         if not toks:
             return ""
-        
-        return toks[0] + "".join(t[-1] for t in toks[1:] if t)
+
+        toks = [t for t in toks if t not in self.special_tokens]
+
+        if not toks:
+            return ""
+
+        k = self.k
+        norm: List[str] = []
+        for t in toks:
+            if t == "<UNK>":
+                norm.append("N" * k)
+            elif isinstance(t, str) and len(t) == k:
+                norm.append(t)
+
+        if not norm:
+            return ""
+
+        seq = norm[0]
+        if k == 1:
+
+            for t in norm[1:]:
+                seq += t
+            return seq
+
+        for t in norm[1:]:
+            seq += t[-1]
+        return seq
 
     def preprocess(self, seq: str) -> str:
-        
         return (seq or "").upper().replace(" ", "")
 
+    def _valid_kmer(self, kmer: str) -> bool:
+        """Validate a k-mer according to ambiguity and alphabet rules."""
+        if len(kmer) != self.k:
+            return False
+        if not self.allow_ambiguous and ("N" in kmer):
+            return False
+        if self.enforce_alphabet:
+            for c in kmer:
+                if c not in self.alphabet:
+                    return False
+        return True
+
     def save_state(self, path: str) -> None:
-        
         import json
 
         data: Dict[str, Any] = {
             "type": self.__class__.__name__,
             "k": self.k,
             "max_vocab_size": self.max_vocab_size,
+            "allow_ambiguous": self.allow_ambiguous,
+            "alphabet": self.alphabet,
+            "enforce_alphabet": self.enforce_alphabet,
+            "_vocab_payload": {
+                "special_tokens": self.special_tokens,
+                "vocab": self.vocab,
+            },
         }
-
-
-        vocab_payload = {
-            "special_tokens": self.special_tokens,
-            "vocab": self.vocab,
-        }
-        data.update({"_vocab_payload": vocab_payload})
-
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def load_state(self, path: str) -> None:
-       
         import json
 
         with open(path, "r", encoding="utf-8") as f:
@@ -110,6 +149,9 @@ class KmerTokenizer(BaseTokenizer):
         self.k = int(data.get("k", self.k))
         mvs = data.get("max_vocab_size", self.max_vocab_size)
         self.max_vocab_size = int(mvs) if mvs is not None else None
+        self.allow_ambiguous = bool(data.get("allow_ambiguous", self.allow_ambiguous))
+        self.alphabet = str(data.get("alphabet", self.alphabet)).upper()
+        self.enforce_alphabet = bool(data.get("enforce_alphabet", self.enforce_alphabet))
 
         vocab_payload = data.get("_vocab_payload", {})
         loaded_vocab = vocab_payload.get("vocab", {})
@@ -119,11 +161,14 @@ class KmerTokenizer(BaseTokenizer):
         if "<PAD>" not in specials:
             specials.insert(0, "<PAD>")
         if "<UNK>" not in specials:
-            specials.insert(1, "<UNK>")
+            insert_at = 1 if len(specials) > 0 else 0
+            specials.insert(insert_at, "<UNK>")
 
         self.special_tokens = specials
         self.vocab = {tok: int(idx) for tok, idx in loaded_vocab.items()}
+
         for tok in self.special_tokens:
             if tok not in self.vocab:
                 self.vocab[tok] = len(self.vocab)
+
         self.inv_vocab = {idx: tok for tok, idx in self.vocab.items()}

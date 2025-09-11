@@ -1,15 +1,19 @@
-# bpe_tokenizer
+# bpe tokenizer
 from __future__ import annotations
 
 import json
-import hashlib
+import os
+from pathlib import Path
 from collections import Counter
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Iterable, Union
 
 from .tokenizer_base import BaseTokenizer
 
-class BPETokenizer(BaseTokenizer):
+Pair = Tuple[str, str]
+PathLike = Union[str, os.PathLike]
 
+
+class BPETokenizer(BaseTokenizer):
     def __init__(
         self,
         vocab_size: int = 1000,
@@ -19,153 +23,114 @@ class BPETokenizer(BaseTokenizer):
         super().__init__(special_tokens)
         self.vocab_size = int(vocab_size)
         self.merge_num = int(merge_num) if merge_num is not None else None
+        self.bpe_ranks: Dict[Pair, int] = {}
         self.end_of_token = "</w>"
-        self.bpe_ranks: Dict[Tuple[str, str], int] = {} 
-        self._frozen: bool = False
-        self.tokenizer_version: str = "bpe.v1"
 
     def preprocess(self, seq: str) -> str:
-        s = (seq or "").upper().replace(" ", "")
-        allowed = set("ACGTUN")  
-        return "".join(ch if ch in allowed else "N" for ch in s)
-
-    def _word_tokens_with_eow(self, seq: str) -> List[str]:
-        s = self.preprocess(seq)
-        if not s:
-            return []
-        if len(s) == 1:
-            return [s + self.end_of_token]
-        return list(s[:-1]) + [s[-1] + self.end_of_token]
+        return (seq or "").upper().replace(" ", "")
 
     @staticmethod
-    def _deterministic_best_pair(pairs: Counter) -> Optional[Tuple[str, str]]:
-        if not pairs:
-            return None
-        max_count = max(pairs.values())
-        candidates = [p for p, c in pairs.items() if c == max_count]
-        return sorted(candidates)[0]
+    def _pairs(tokens: List[str]) -> Iterable[Pair]:
 
-    @staticmethod
-    def _merge_once(tokens: List[str], pair: Tuple[str, str]) -> List[str]:
-        A, B = pair
-        merged = []
-        i = 0
-        while i < len(tokens):
-            if i < len(tokens) - 1 and tokens[i] == A and tokens[i + 1] == B:
-                merged.append(A + B)  # concat strings
-                i += 2
-            else:
-                merged.append(tokens[i])
-                i += 1
-        return merged
+        return zip(tokens, tokens[1:])
+
+    def get_stats(self, tokens_list: List[List[str]]) -> Counter:
+        pairs = Counter()
+        for tokens in tokens_list:
+            pairs.update(self._pairs(tokens))
+        return pairs
+
+    def merge_vocab(self, tokens_list: List[List[str]], pair: Pair) -> List[List[str]]:
+        bigram = "".join(pair)
+        new_tokens_list: List[List[str]] = []
+        for tokens in tokens_list:
+            merged_tokens: List[str] = []
+            i = 0
+            n = len(tokens)
+            while i < n:
+                if i < n - 1 and (tokens[i], tokens[i + 1]) == pair:
+                    merged_tokens.append(bigram)
+                    i += 2
+                else:
+                    merged_tokens.append(tokens[i])
+                    i += 1
+            new_tokens_list.append(merged_tokens)
+        return new_tokens_list
 
     def train(self, sequences: List[str]) -> None:
-        if self._frozen:
-            raise RuntimeError("Tokenizer is frozen; refuse to retrain (avoid leakage).")
+        eot = self.end_of_token
+        tokens_list: List[List[str]] = [
+            [ch + eot for ch in self.preprocess(seq)]
+            for seq in sequences
+        ]
 
-        corpus_tokens: List[List[str]] = [self._word_tokens_with_eow(seq) for seq in sequences if seq]
-
-        while True:
-            if self.merge_num is not None and len(self.bpe_ranks) >= self.merge_num:
+        prev_pairs: Optional[Counter] = None
+        while (
+            (self.merge_num is None or len(self.bpe_ranks) < self.merge_num)
+            and len(self.vocab) < self.vocab_size
+        ):
+            pairs = self.get_stats(tokens_list)
+            if not pairs or pairs == prev_pairs:
                 break
-            if len(self.bpe_ranks) >= max(0, self.vocab_size - len(self.vocab)):
-                break
+            prev_pairs = pairs
 
-            pair_counts = Counter()
-            for toks in corpus_tokens:
-                for i in range(len(toks) - 1):
-                    pair_counts[(toks[i], toks[i + 1])] += 1
+            best_pair = max(pairs, key=pairs.get)
+            self.bpe_ranks[best_pair] = len(self.bpe_ranks)
+            tokens_list = self.merge_vocab(tokens_list, best_pair)
 
-            best = self._deterministic_best_pair(pair_counts)
-            if best is None or pair_counts[best] <= 0:
-                break
-
-            self.bpe_ranks[best] = len(self.bpe_ranks) 
-            corpus_tokens = [self._merge_once(toks, best) for toks in corpus_tokens]
-
-            if self.merge_num is None and len(self.bpe_ranks) >= 10 * self.vocab_size:
-                break
-
-        for toks in corpus_tokens:
-            for tok in toks:
-                if tok not in self.vocab:
+        for tokens in tokens_list:
+            for token in tokens:
+                if token not in self.vocab:
                     if len(self.vocab) >= self.vocab_size:
-                        break
+                        return
                     idx = len(self.vocab)
-                    self.vocab[tok] = idx
-                    self.inv_vocab[idx] = tok
-
+                    self.vocab[token] = idx
+                    self.inv_vocab[idx] = token
 
     def encode(self, sequence: str) -> List[int]:
-        toks = self._word_tokens_with_eow(sequence)
-        if not toks:
-            return []
-        pair2rank = self.bpe_ranks
-        if not pair2rank:
-            unk = self.unk_id()
-            return [self.vocab.get(t, unk) for t in toks]
-
-        while True:
-            best_pair = None
-            best_rank = None
-            for i in range(len(toks) - 1):
-                p = (toks[i], toks[i + 1])
-                r = pair2rank.get(p)
-                if r is None:
-                    continue
-                if best_rank is None or r < best_rank:
-                    best_rank = r
-                    best_pair = p
-            if best_pair is None:
-                break
-            toks = self._merge_once(toks, best_pair)
+       
+        eot = self.end_of_token
+        tokens = [ch + eot for ch in self.preprocess(sequence)]
+        i = 0
+        n = len(tokens)
+        while i < n - 1:
+            pair = (tokens[i], tokens[i + 1])
+            if pair in self.bpe_ranks:
+                merged_token = "".join(pair)
+                tokens[i : i + 2] = [merged_token]
+                n -= 1  
+                i = max(i - 1, 0)
+            else:
+                i += 1
 
         unk_id = self.unk_id()
-        return [self.vocab.get(t, unk_id) for t in toks]
+        return [self.vocab.get(token, unk_id) for token in tokens]
 
     def decode(self, token_ids: List[int]) -> str:
-        toks = [self.inv_vocab.get(int(idx), self.special_tokens_map.get("UNK", "<UNK>")) for idx in token_ids]
-        return "".join(t.replace(self.end_of_token, "") for t in toks)
+        tokens = [self.inv_vocab.get(int(idx), "<UNK>") for idx in token_ids]
+        eot = self.end_of_token
+        return "".join(tok.replace(eot, "") for tok in tokens)
 
-    def effective_vocab_size(self) -> int:
-        return int(len(self.vocab))
-
-    def freeze(self) -> None:
-        self._frozen = True
-
-    @property
-    def is_frozen(self) -> bool:
-        return self._frozen
-
-    def _checksum(self) -> str:
-        h = hashlib.sha256()
-        for tok, idx in sorted(self.vocab.items(), key=lambda x: x[1]):
-            h.update(f"{idx}:{tok}".encode("utf-8"))
-        for (a, b), r in sorted(self.bpe_ranks.items(), key=lambda x: x[1]):
-            h.update(f"{r}:{a}|{b}".encode("utf-8"))
-        return h.hexdigest()
-
-    def save_state(self, path: str) -> None:
+    def save_state(self, path: PathLike) -> None:
         data: Dict[str, Any] = {
             "type": self.__class__.__name__,
-            "version": self.tokenizer_version,
             "vocab_size": self.vocab_size,
             "merge_num": self.merge_num,
             "special_tokens": self.special_tokens,
             "end_of_token": self.end_of_token,
             "vocab": self.vocab,
             "bpe_ranks": {f"{a}\t{b}": r for (a, b), r in self.bpe_ranks.items()},
-            "frozen": self._frozen,
-            "checksum": self._checksum(),
         }
-        with open(path, "w", encoding="utf-8") as f:
+        path = Path(path)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path) 
 
-    def load_state(self, path: str) -> None:
+    def load_state(self, path: PathLike) -> None:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        self.tokenizer_version = data.get("version", self.tokenizer_version)
         self.vocab_size = int(data.get("vocab_size", self.vocab_size))
         self.merge_num = data.get("merge_num", self.merge_num)
         self.special_tokens = data.get("special_tokens", self.special_tokens)
@@ -179,7 +144,33 @@ class BPETokenizer(BaseTokenizer):
             a, b = k.split("\t")
             self.bpe_ranks[(a, b)] = int(r)
 
-        self._frozen = bool(data.get("frozen", False))
-    
-        _saved = data.get("checksum")
-       
+    @classmethod
+    def from_config_path(cls, cfg_path: PathLike) -> "BPETokenizer":
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tok = cls(
+            vocab_size=int(cfg.get("vocab_size", 1000)),
+            merge_num=cfg.get("merge_num"),
+            special_tokens=cfg.get("special_tokens"),
+        )
+        eot = cfg.get("end_of_token")
+        if eot is not None:
+            tok.end_of_token = str(eot)
+        return tok
+
+    def update_from_config(self, cfg: Dict[str, Any]) -> None:
+        if "vocab_size" in cfg:
+            self.vocab_size = int(cfg["vocab_size"])
+        if "merge_num" in cfg:
+            self.merge_num = cfg["merge_num"]
+        if "special_tokens" in cfg:
+            self.special_tokens = cfg["special_tokens"]
+        if "end_of_token" in cfg:
+            self.end_of_token = str(cfg["end_of_token"])
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(vocab_size={self.vocab_size}, "
+            f"merge_num={self.merge_num}, end_of_token={self.end_of_token!r}, "
+            f"vocab={len(self.vocab)}, merges={len(self.bpe_ranks)})"
+        )
