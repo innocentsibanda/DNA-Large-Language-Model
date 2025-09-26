@@ -200,7 +200,7 @@ TOKENIZER_HYBRID_PATH = "hybrid_vocab.json"
 TOKENIZER_KMER_PATH   = "kmer_vocab.json"
 STAGE_LOG_PATH = "stage_gates.jsonl"          
 RUN_CONFIG_SNAPSHOT = "config_snapshot.json"  
-TOKENIZER_META_PATH = "tokenizer_meta.json
+TOKENIZER_META_PATH = "tokenizer_meta.json"
 
 # Checkpoints per stage
 CKPT_STAGE1A = "stage1a_pretrained.pt"
