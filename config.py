@@ -1,14 +1,14 @@
 # Central Configurations 
 
 # Data
-DATA_FILES = ["Data/combined_complete.labeled.txt
+DATA_FILES = ["Data/combined_complete.txt
 "]
-PARTIAL_DATA_FILES = ["Data/partial_sequences.txt"]  
-STAGE2_RIBOZYME_FULL_FILES = ["Data/ribo_full.txt"]
-STAGE3_RIBOZYME_PARTIAL_FILES = ["Data/ribo_partial.txt"]
-STAGE4_WEAK_SEQCLS = ["Data/weak_seq_class_partial.txt"]
-STAGE5_WEAK_RIBOZYME_SEQCLS = ["Data/weak_ribozyme_seqcls.txt"]
-STAGE6_GOLD_MIXED = ["Data/gold_motifs_mixed.jsonl"]
+PARTIAL_DATA_FILES = ["Data/combined_partials.txt"]  
+STAGE2_RIBOZYME_FULL_FILES = ["Data/combined_partials_labeled.txt"]
+STAGE3_RIBOZYME_PARTIAL_FILES = ["Data/combined_partials_labeled.txt"]
+STAGE4_WEAK_SEQCLS = ["Data/combined_partials_labeled.txt"]
+STAGE5_WEAK_RIBOZYME_SEQCLS = ["Data/combined_partials_labeled.txt"]
+STAGE6_GOLD_MIXED = ["Data/combined_partials_labeled.txt"]
 
 # Global sampling for tokenizer & Stage 1a
 DATASET_FRACTION = 0.0001
