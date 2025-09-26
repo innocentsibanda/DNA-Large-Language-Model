@@ -1,7 +1,8 @@
 # Central Configurations 
 
 # Data
-DATA_FILES = ["Data/complete_sequences.txt"]  
+DATA_FILES = ["Data/combined_complete.labeled.txt
+"]
 PARTIAL_DATA_FILES = ["Data/partial_sequences.txt"]  
 STAGE2_RIBOZYME_FULL_FILES = ["Data/ribo_full.txt"]
 STAGE3_RIBOZYME_PARTIAL_FILES = ["Data/ribo_partial.txt"]
